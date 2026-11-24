@@ -1,0 +1,50 @@
+[
+  {
+    "orderId": "ORD-1001",
+    "tenantId": "tenant-a",
+    "userId": "u-1",
+    "item": "静音降噪耳机 Pro",
+    "amount": 899.00,
+    "status": "已签收",
+    "purchasedAt": "2026-10-28",
+    "sku": "HP-X1-BLK",
+    "issue": "左耳无声音",
+    "receiver": "王小明",
+    "phone": "13812345678",
+    "address": "上海市浦东新区世纪大道 100 号",
+    "returnWindowDays": 7,
+    "warrantyMonths": 12
+  },
+  {
+    "orderId": "ORD-1002",
+    "tenantId": "tenant-a",
+    "userId": "u-2",
+    "item": "便携蓝牙音箱 Mini",
+    "amount": 299.00,
+    "status": "运输中",
+    "purchasedAt": "2026-11-20",
+    "sku": "SP-M2-WHT",
+    "issue": "物流停滞",
+    "receiver": "李雷",
+    "phone": "13900001111",
+    "address": "北京市朝阳区建国路 88 号",
+    "returnWindowDays": 7,
+    "warrantyMonths": 12
+  },
+  {
+    "orderId": "ORD-1003",
+    "tenantId": "tenant-b",
+    "userId": "u-3",
+    "item": "机械键盘 K8",
+    "amount": 499.00,
+    "status": "已签收",
+    "purchasedAt": "2026-09-01",
+    "sku": "KB-K8-RGB",
+    "issue": "按键失灵",
+    "receiver": "韩梅梅",
+    "phone": "13700002222",
+    "address": "深圳市南山区科技园 1 号",
+    "returnWindowDays": 7,
+    "warrantyMonths": 12
+  }
+]

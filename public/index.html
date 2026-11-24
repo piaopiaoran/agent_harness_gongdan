@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agent_harness_gongdan · 售后工单 Agent 控制台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">AG</span>
+      <div>
+        <h1>售后工单 Agent</h1>
+        <p>Agent Harness 六层执行标准 · 面试学习控制台</p>
+      </div>
+    </div>
+    <div class="runtime" id="runtime"><span class="badge">加载中…</span></div>
+  </header>
+
+  <main class="layout">
+    <aside class="panel side">
+      <section class="block">
+        <h2>身份（演示用）</h2>
+        <label class="field-label" for="tenantId">tenant_id</label>
+        <input class="input" id="tenantId" value="tenant-a" autocomplete="off">
+        <label class="field-label" for="userId">user_id</label>
+        <input class="input" id="userId" value="u-1" autocomplete="off">
+        <label class="field-label" for="role">role</label>
+        <select class="input" id="role">
+          <option value="user">user</option>
+          <option value="admin">admin</option>
+        </select>
+        <p class="warning">生产环境身份必须由 JWT / OIDC 会话注入；这里的请求头可随意切换，正是为了让越权风险看得见。</p>
+      </section>
+
+      <section class="block">
+        <h2>预设场景</h2>
+        <div id="scenarios" class="scenarios"></div>
+      </section>
+
+      <section class="block">
+        <h2>Harness 六层</h2>
+        <div class="modules" id="modules"></div>
+      </section>
+
+      <section class="block">
+        <h2>工具 allowlist</h2>
+        <div class="tools" id="tools"></div>
+        <p class="hint-block">模型只能看到注册工具的描述；tool_call 是「请求」，执行权在 L5 网关。</p>
+      </section>
+    </aside>
+
+    <section class="panel chat">
+      <div class="chat-head">
+        <h2>工单对话</h2>
+        <span class="hint" id="traceHint">每次发送 = 一条 LangSmith trace</span>
+      </div>
+      <div class="messages" id="messages">
+        <div class="msg system">
+          <div class="msg-label">引导</div>
+          <div class="msg-body">试试左侧场景：政策咨询会走完整 RAG 引用链；退款请求会触发人工审批闸门；注入攻击会被 L3 fail-close 拦截。</div>
+        </div>
+      </div>
+      <div class="approval" id="approval" hidden></div>
+      <div class="composer">
+        <textarea id="input" rows="3" placeholder="描述你的售后问题，或点击左侧场景…"></textarea>
+        <div class="composer-row">
+          <span class="status" id="status"></span>
+          <button class="btn primary" id="send">发送工单</button>
+        </div>
+      </div>
+    </section>
+
+    <aside class="panel inspect">
+      <div class="tabs" id="tabs">
+        <button class="tab active" data-tab="pipeline">执行链</button>
+        <button class="tab" data-tab="rag">RAG</button>
+        <button class="tab" data-tab="memory">记忆</button>
+        <button class="tab" data-tab="context">上下文</button>
+        <button class="tab" data-tab="security">安全</button>
+        <button class="tab" data-tab="learn">讲解</button>
+      </div>
+
+      <div class="tab-panel" id="tab-pipeline">
+        <div class="flow" id="flow"></div>
+        <h3>审计时间线 <span class="hint">点击节点看详情</span></h3>
+        <div class="audit" id="audit"></div>
+      </div>
+
+      <div class="tab-panel" id="tab-rag" hidden>
+        <h3>检索链路</h3>
+        <div class="stages" id="ragStages"><p class="empty">尚未检索</p></div>
+        <h3>降级事件</h3>
+        <div class="degradations" id="degradations"></div>
+        <h3>证据块（强制引用）</h3>
+        <div class="evidence" id="evidence"></div>
+      </div>
+
+      <div class="tab-panel" id="tab-memory" hidden>
+        <h3>语义记忆 · 稳定事实</h3>
+        <div class="facts" id="facts"><p class="empty">加载中…</p></div>
+        <h3>情景记忆 · 蒸馏摘要</h3>
+        <div class="episodes" id="episodes"></div>
+        <p class="hint-block">两套召回源独立存表、分区注入；Checkpoint 只存图执行快照，不存长期记忆。</p>
+      </div>
+
+      <div class="tab-panel" id="tab-context" hidden>
+        <h3>共享窗口预算</h3>
+        <div class="budget" id="budget"></div>
+        <h3>裁剪记录</h3>
+        <div class="trimming" id="trimming"></div>
+        <p class="hint-block">填充优先级：系统指令 → Agent State → 近程轨迹 → 检索记忆 → 远端摘要；Headroom 强制预留 35%。</p>
+      </div>
+
+      <div class="tab-panel" id="tab-security" hidden>
+        <h3>L1–L10 防线地图</h3>
+        <div class="layers" id="layers"></div>
+        <h3>本次决策</h3>
+        <div class="decisions" id="decisions"></div>
+      </div>
+
+      <div class="tab-panel" id="tab-learn" hidden>
+        <div class="learn" id="learn"></div>
+      </div>
+    </aside>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

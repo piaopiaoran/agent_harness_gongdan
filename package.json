@@ -1,0 +1,36 @@
+{
+  "name": "agent_harness_gongdan",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "售后工单 Agent：按 Agent Harness 统一执行标准落地的可观测实验台（面试学习向）",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "db:init": "node scripts/init-db.mjs",
+    "db:check": "node scripts/check-db.mjs",
+    "seed": "node scripts/seed.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "eval": "node scripts/eval.mjs",
+    "chat": "node scripts/chat.mjs",
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "LANGSMITH_TRACING=false node --test tests/*.test.js",
+    "check:llm": "node scripts/check-llm.mjs",
+    "check:smith": "node scripts/check-smith.mjs",
+    "eval:smith": "node scripts/eval-smith.mjs"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.4.2",
+    "@langchain/langgraph": "^1.7.5",
+    "@langchain/langgraph-checkpoint-postgres": "^1.1.4",
+    "@langchain/openai": "^1.8.4",
+    "dotenv": "^16.4.5",
+    "express": "^5.3.0",
+    "ioredis": "^5.4.1",
+    "langsmith": "^0.14.0",
+    "pg": "^8.13.1",
+    "zod": "^3.24.1"
+  }
+}
