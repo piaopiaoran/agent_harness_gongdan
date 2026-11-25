@@ -10,6 +10,61 @@ import { retrieveEvidence } from "../rag/retrieve.js";
 import { assembleContext } from "../context/assemble.js";
 import { recordTurn as recordWorkingTurn } from "../memory/working.js";
 
+/**
+ * 协议完整性：OpenAI 兼容端点要求每个 assistant.tool_calls 都有对应 tool_call_id 的
+ * ToolMessage 回应，**且回应必须紧跟在该 assistant 消息之后**。
+ *
+ * 只「在数组末尾补 ToolMessage」是不够的：如果历史里 AI(tool_calls) 与新 HumanMessage
+ * 交错（interrupt 未审批就开新轮、旧脏 checkpoint 等），补出来的 ToolMessage 会排在
+ * HumanMessage 后面，端点依然判为 insufficient tool messages。
+ *
+ * 这里重建消息顺序：按 tool_call_id 把已有 ToolMessage 归位到对应 AIMessage 之后，
+ * 真正缺失的才补占位回应。返回 repairs 供 checkpoint 落库，逐步自愈历史。
+ */
+export function repairMessageSequence(messages, reason = "该工具调用未被执行") {
+  const list = Array.isArray(messages) ? messages : [];
+
+  // 先看全量历史，避免把「稍后才回应」的调用误判为悬空而重复补。
+  const answers = new Map();
+  for (const m of list) {
+    if (m?.tool_call_id && !answers.has(m.tool_call_id)) answers.set(m.tool_call_id, m);
+  }
+
+  const out = [];
+  const repairs = [];
+  for (const m of list) {
+    // ToolMessage 统一在归属 AIMessage 后面归位，原位置先跳过。
+    if (m?.tool_call_id) continue;
+    out.push(m);
+    for (const c of m?.tool_calls ?? []) {
+      if (!c?.id) continue;
+      const answer = answers.get(c.id);
+      if (answer) {
+        out.push(answer);
+      } else {
+        const fix = new ToolMessage({
+          content: `[未执行] ${reason}（tool: ${c.name ?? "unknown"}）`,
+          tool_call_id: c.id,
+        });
+        out.push(fix);
+        repairs.push(fix);
+      }
+    }
+  }
+
+  // 找不到归属 AIMessage 的 ToolMessage 原样保留，绝不丢历史。
+  const placed = new Set(out);
+  for (const m of list) {
+    if (m?.tool_call_id && !placed.has(m)) out.push(m);
+  }
+  return { messages: out, repairs };
+}
+
+/** 兼容旧调用点：只返回需要补写的 ToolMessage。 */
+export function unansweredToolReplies(messages, reason = "该工具调用未被执行") {
+  return repairMessageSequence(messages, reason).repairs;
+}
+
 export function createNodes(deps) {
   const { auditor, identity, embedder, model, registry, queue, rateResult } = deps;
   const emit = (...args) => auditor.emit(...args);
@@ -85,7 +140,13 @@ export function createNodes(deps) {
 
     // ---------------- 模型推理：只产出 tool_call「请求」，不拥有执行权 ----------------
     async agent(state) {
-      const messages = [new SystemMessage(state.systemText || SYSTEM_PROMPT), ...state.messages];
+      // 最后一道协议防线：历史 checkpoint 可能来自修复前的版本（悬空 tool_calls），
+      // 或 reject/executeTools 之外的分支。入模前按 tool_call_id 归位 + 补写。
+      const healed = repairMessageSequence(state.messages, "该工具调用未被执行，请基于已有信息回答");
+      if (healed.repairs.length) {
+        await emit("agent", "tool_replies_repaired", "degrade", ["orphan_tool_call"], { count: healed.repairs.length });
+      }
+      const messages = [new SystemMessage(state.systemText || SYSTEM_PROMPT), ...healed.messages];
       let reply;
       try {
         reply = await invokeModel(deps.model, messages);
@@ -100,14 +161,14 @@ export function createNodes(deps) {
         { tools: calls.map((c) => c.name), textChars: text.length, steps, usage: reply.usage_metadata ?? null });
 
       if (!calls.length) {
-        return { messages: [reply], finalAnswer: text, steps, verdict: "answer" };
+        return { messages: [reply, ...healed.repairs], finalAnswer: text, steps, verdict: "answer" };
       }
       const plan = calls.map((c) => ({
         id: c.id, name: c.name, args: c.args ?? {},
         auth: authorizeTool({ name: c.name, args: c.args ?? {}, role: identity.role }),
       }));
       return {
-        messages: [reply], toolPlan: plan, steps, verdict: "tool_calls",
+        messages: [reply, ...healed.repairs], toolPlan: plan, steps, verdict: "tool_calls",
         finalAnswer: text,
       };
     },
@@ -159,13 +220,31 @@ export function createNodes(deps) {
     },
 
     // ---------------- L6 受控执行：参数脱敏 + 输出截断 + 逐次审计 ----------------
+    // 协议不变量：模型每发出一个 tool_call_id，都必须收到一条 ToolMessage 回应。
+    // 之前只对 allow 的工具回应，deny/escalate-rejected 的调用悬空 → 下一轮重发历史时
+    // DeepSeek/OpenAI 兼容端点返回 400 insufficient tool messages。现在所有分支都回应。
     async executeTools(state) {
       const toolMessages = [];
       const results = [];
       for (const p of state.toolPlan) {
-        if (p.auth.decision !== "allow") continue;
+        // 拒绝分支也必须回应，但绝不执行工具本身
+        if (p.auth.decision !== "allow") {
+          const reason = p.auth.reason || "not_authorized";
+          const msg = `[网关拒绝] 工具 ${p.name} 未执行：${reason}`;
+          results.push({ name: p.name, denied: true, reason });
+          toolMessages.push(new ToolMessage({ content: msg, tool_call_id: p.id }));
+          await emit("executeTools", "tool_execution_denied", "deny", ["unauthorized_tool"],
+            { tool: p.name, reason });
+          continue;
+        }
         const t = registry.get(p.name);
-        if (!t) continue;
+        if (!t) {
+          const msg = `[工具不可用] ${p.name} 未在注册表`;
+          results.push({ name: p.name, error: msg });
+          toolMessages.push(new ToolMessage({ content: msg, tool_call_id: p.id }));
+          await emit("executeTools", "tool_missing", "degrade", ["tool_missing"], { tool: p.name });
+          continue;
+        }
         try {
           const out = await t.invoke(p.auth.safeArgs ?? p.args);
           const masked = maskPII(String(out)).masked.slice(0, config.MAX_TOOL_OUTPUT_CHARS);
@@ -179,6 +258,7 @@ export function createNodes(deps) {
           await emit("executeTools", "tool_failed", "degrade", ["tool_error"], { tool: p.name, reason: err.message });
         }
       }
+      // 兜底：toolPlan 为空但仍走出工具路径时，至少给一条占位回应
       if (!toolMessages.length) {
         toolMessages.push(new ToolMessage({ content: "[网关拒绝] 没有工具被授权执行", tool_call_id: state.toolPlan[0]?.id ?? "denied" }));
       }
@@ -213,7 +293,13 @@ export function createNodes(deps) {
           ? `模型服务暂时不可用（${state.refusalReason ?? "timeout"}）。请稍后重试或联系人文客服。`
           : "该请求未通过安全策略校验，已被拒绝。请调整表述后重试。";
       await emit("reject", "request_rejected", "deny", [state.verdict], { reason: state.refusalReason ?? state.input.reason });
-      return { finalAnswer: answer, verdict: "rejected" };
+      // 协议完整性：toolGate 全 deny 时会跳过 executeTools，agent 产出的 tool_calls
+      // 若悬空写进 checkpoint，下一轮重发历史就会触发 400。这里在离图前补齐回应。
+      const extra = unansweredToolReplies(state.messages, "该请求未通过安全策略校验，工具未执行");
+      if (extra.length) {
+        await emit("reject", "tool_replies_repaired", "degrade", ["orphan_tool_call"], { count: extra.length });
+      }
+      return { messages: extra, finalAnswer: answer, verdict: "rejected" };
     },
 
     // ---------------- 工作记忆落库 + 异步蒸馏入队（不阻塞主请求）----------------

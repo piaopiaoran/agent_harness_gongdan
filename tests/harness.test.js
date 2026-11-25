@@ -8,6 +8,9 @@ import { maskPII, maskToolArgs } from "../src/security/pii.js";
 import { guardInput, guardOutput } from "../src/security/guard.js";
 import { authorizeTool } from "../src/security/rbac.js";
 import { assembleContext } from "../src/context/assemble.js";
+import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
+import { unansweredToolReplies, repairMessageSequence } from "../src/graph/nodes.js";
+import { resolveSessionId } from "../src/server.js";
 
 test("分词保留词典专名与英文数字连续 token", () => {
   const tokens = segment("ORD-1001 左耳无声音，申请七天无理由退货");
@@ -83,6 +86,55 @@ test("上下文编排：共享窗口不溢出，来源分区标注，系统指�
   assert.ok(r.report.sourceLabels.includes("episodic"));
   assert.ok(r.report.sourceLabels.includes("semantic"));
   assert.match(r.systemMessage.content, /检索证据/);
+});
+
+test("协议完整性：悬空 tool_calls 必须补齐，已回应的不重复补（防 400）", () => {
+  const ai = (id) => new AIMessage({ content: "", tool_calls: [{ id, name: "get_order_status", args: {} }] });
+  const history = [
+    new HumanMessage("查订单"),
+    ai("call-1"),
+    ai("call-2"),
+    new ToolMessage({ content: "已授权结果", tool_call_id: "call-1" }),
+  ];
+  const fixes = unansweredToolReplies(history, "未执行");
+  assert.equal(fixes.length, 1, "只补未回应的 call-2");
+  assert.equal(fixes[0].tool_call_id, "call-2");
+  assert.match(fixes[0].content, /未执行/);
+
+  const complete = [
+    new HumanMessage("查订单"), ai("call-1"),
+    new ToolMessage({ content: "结果", tool_call_id: "call-1" }),
+  ];
+  assert.equal(unansweredToolReplies(complete).length, 0, "完整历史不补");
+});
+
+test("协议顺序修复：tool 回复必须紧跟对应 tool_calls，不能被后续 HumanMessage 隔开", () => {
+  const ai = (id) => new AIMessage({ content: "", tool_calls: [{ id, name: "get_order_status", args: {} }] });
+  // 复现真实故障：AI(tool_calls) → Human(新一轮) → 迟到的 ToolMessage
+  const history = [
+    new HumanMessage("查订单"),
+    ai("call-1"),
+    new HumanMessage("耳机保修期多久？"),
+    new ToolMessage({ content: "迟到的结果", tool_call_id: "call-1" }),
+  ];
+  const { messages, repairs } = repairMessageSequence(history, "未执行");
+  assert.deepEqual(messages.map((m) => m.getType()), ["human", "ai", "tool", "human"]);
+  assert.equal(messages[2].tool_call_id, "call-1");
+  assert.equal(repairs.length, 0, "已有回应只归位，不重复补");
+
+  const orphan = [new HumanMessage("查订单"), ai("call-9"), new HumanMessage("下一轮")];
+  const healed = repairMessageSequence(orphan, "未执行");
+  assert.deepEqual(healed.messages.map((m) => m.getType()), ["human", "ai", "tool", "human"]);
+  assert.equal(healed.repairs[0].tool_call_id, "call-9");
+});
+
+test("空 sessionId 不会退化成共享 checkpoint 线程", () => {
+  const a = resolveSessionId("");
+  const b = resolveSessionId("   ");
+  assert.match(a, /^[0-9a-f-]{36}$/);
+  assert.match(b, /^[0-9a-f-]{36}$/);
+  assert.notEqual(a, b);
+  assert.equal(resolveSessionId("my-thread"), "my-thread");
 });
 
 test("数据库对象命名：schema.sql 中所有对象以项目前缀开头", async () => {

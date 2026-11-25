@@ -18,6 +18,9 @@ const schema = z.object({
   LANGSMITH_API_KEY: z.string().optional().default(""),
   LANGSMITH_PROJECT: z.string().default("agent_harness_gongdan"),
   LANGSMITH_ENDPOINT: z.string().default("https://api.smith.langchain.com"),
+  // LLM Gateway：本地代码只用 LANGSMITH_API_KEY 认证，provider key 留在 workspace secret。
+  // TypeSafe SDK 自行拼接 /v1/systemone，这里填网关根地址，不能带 /v1。
+  LANGSMITH_GATEWAY_BASE_URL: z.string().default("https://gateway.smith.langchain.com"),
 
   LLM_PROVIDER: z.enum(["fake", "openai"]).default("fake"),
   LLM_BASE_URL: z.string().default("https://api.openai.com/v1"),
@@ -27,6 +30,11 @@ const schema = z.object({
   LLM_MAX_TOKENS: z.coerce.number().int().positive().default(1024),
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
   LLM_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
+
+  // 评测 judge：Jev（TypeSafe System One），离线与在线共用同一模型与同一套 question 名。
+  // 本地经 LangSmith Gateway 调用，只持有 LANGSMITH_API_KEY；TypeSafe key 存 workspace secret。
+  JUDGE_MODEL: z.string().default("typesafe/jev-1.13.0"),
+  JUDGE_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
 
   EMBEDDING_PROVIDER: z.enum(["siliconflow", "fake"]).default("fake"),
   EMBEDDING_BASE_URL: z.string().default(""),
@@ -82,6 +90,26 @@ export function assertSafeEndpoint(raw, label = "endpoint") {
 }
 
 /**
+ * LLM Gateway 端点校验：与 assertSafeEndpoint 规则一致（HTTPS / 无凭据查询串），
+ * 但保留路径（网关的 /v1 是路由的一部分，不能像 trace endpoint 那样只取 origin）。
+ */
+export function assertGatewayEndpoint(raw, label = "gateway endpoint") {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error(`[config] ${label} 不是合法 URL`);
+  }
+  if (u.protocol !== "https:") {
+    throw new Error(`[config] ${label} 必须使用 HTTPS，当前 ${u.protocol}`);
+  }
+  if (u.username || u.password || u.search || u.hash) {
+    throw new Error(`[config] ${label} 不允许在 URL 中夹带凭据或查询串`);
+  }
+  return raw.replace(/\/+$/, "");
+}
+
+/**
  * 共享数据库约束：5432/postgres 由多个项目共用，不允许偷偷改端口、库名或主机。
  */
 export function assertSharedDatabase(raw) {
@@ -124,6 +152,9 @@ const useRealEmbedding = env.EMBEDDING_PROVIDER === "siliconflow" && Boolean(EMB
 const embeddingEndpoint = useRealEmbedding
   ? assertSafeEndpoint(env.EMBEDDING_BASE_URL, "EMBEDDING_BASE_URL")
   : "local-fake";
+// judge 固定经 LangSmith Gateway 调 Jev。此处不强制要求 LANGSMITH_API_KEY，
+// 由 eval-smith.mjs 的网关预检给出可操作的报错，避免影响不跑评测的服务进程。
+const judgeGatewayEndpoint = assertGatewayEndpoint(env.LANGSMITH_GATEWAY_BASE_URL, "LANGSMITH_GATEWAY_BASE_URL");
 
 // LangChain / LangGraph 自动读取这些变量决定是否上报 trace。
 // 这里显式回写一遍，保证「先加载 config、后加载 LangChain」的顺序不依赖 import 顺序。
@@ -168,6 +199,13 @@ export const config = Object.freeze({
     enabled: env.LANGSMITH_TRACING === "true" && LANGSMITH_API_KEY.length > 0,
     project: env.LANGSMITH_PROJECT,
     endpoint: env.LANGSMITH_ENDPOINT,
+  }),
+  judge: Object.freeze({
+    model: env.JUDGE_MODEL,
+    provider: "typesafe",
+    gatewayEndpoint: judgeGatewayEndpoint,
+    timeoutMs: env.JUDGE_TIMEOUT_MS,
+    label: `${env.JUDGE_MODEL} @ LangSmith Gateway (Jev)`,
   }),
   tables: Object.freeze({
     workingMemory: `${PREFIX}_working_memory`,

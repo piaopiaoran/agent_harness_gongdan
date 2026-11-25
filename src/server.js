@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
@@ -11,6 +12,15 @@ import { TOOL_META } from "./tools.js";
 
 const publicDir = join(dirname(fileURLToPath(import.meta.url)), "..", "public");
 const MAX_SESSIONS = 300;
+
+/**
+ * 会话 ID 即 LangGraph 的 thread_id。空字符串会让所有匿名访客共用同一个 checkpoint，
+ * 历史越堆越长，还把上一次未回应的 tool_calls 带进下一轮请求。这里强制生成独立 UUID。
+ */
+export function resolveSessionId(input) {
+  const value = String(input ?? "").trim();
+  return value && value.length <= 128 ? value : randomUUID();
+}
 
 export function buildApp(runtime) {
   const app = express();
@@ -56,7 +66,7 @@ export function buildApp(runtime) {
     const rl = await runtime.rateLimiter.check(`${tenantId}:${userId}`);
     if (!rl.ok) return res.status(429).json({ error: "rate_limited", retryAfterMs: rl.retryAfterMs });
 
-    const sessionId = String(req.body?.sessionId ?? "");
+    const sessionId = resolveSessionId(req.body?.sessionId);
     const sess = createSession(runtime, { tenantId, userId, role, sessionId, rateResult: rl });
     sessions.set(sess.sessionId, sess);
     if (sessions.size > MAX_SESSIONS) sessions.delete(sessions.keys().next().value);

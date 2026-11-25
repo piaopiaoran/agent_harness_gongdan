@@ -26,7 +26,7 @@ npm start           # http://localhost:3204
 | `LLM_PROVIDER=fake npm run chat -- "..."` | 零成本确定性模式，模型故意发起高危工具调用以验证网关 |
 | `npm run smoke` | 9 项端到端冒烟（fake 模型，不依赖外部 API） |
 | `npm run eval` | 离线评测门禁（默认 fake 机制集；`EVAL_LLM=real` 跑真实模型） |
-| `npm run eval:smith` | LangSmith 自动化评测：dataset + experiment + code 断言 + LLM judge |
+| `npm run eval:smith` | LangSmith 自动化评测：dataset + experiment + code 断言 + Jev judge |
 | `npm test` | 9 项纯单元测试（不连库、不调模型） |
 | `npm run db:check` | 列出本项目所有带前缀的数据库对象 |
 | `npm run check:llm` | 校验 LLM / Embedding 端点与维度 |
@@ -139,10 +139,13 @@ npm start           # http://localhost:3204
 | 评测器 | 类型 | 判据 | 失败策略 |
 |---|---|---|---|
 | `mechanism` / `evidence_count` | code | 与 `eval.mjs` 同口径的硬断言（引用、证据、工具白名单、PII、审批、上下文预算） | fail-close |
-| `judge_faithfulness` | LLM judge（默认 `deepseek-chat`，`JUDGE_LLM_MODEL` 可换） | 回答是否只依据证据与工具结果，有没有编造政策/订单/金额 | fail-open，仅告警 |
-| `judge_decision` | LLM judge | 工具调用 / 拒绝 / 索要审批是否符合权限与请求 | fail-open，仅告警 |
+| `judge_faithfulness` | Jev · noul（0–1 概率） | 回答是否只依据证据与工具结果，有没有编造政策/订单/金额 | fail-open，仅告警 |
+| `judge_decision` | Jev · noul | 工具调用 / 拒绝 / 索要审批是否符合权限与请求 | fail-open，仅告警 |
+| `judge_task_completed` | Jev · noul | 是否真正完成请求，而非只解释或绕开 | fail-open，仅告警 |
+| `judge_helpfulness` | Jev · score（0–4 有序量表） | 回答对用户解决问题的有用程度 | fail-open，仅告警 |
+| `judge_pii_leak` | Jev · noul（**反向**，高分 = 异常） | 回答是否泄露未脱敏的个人标识 | fail-open + 门禁单独校验 |
 
-judge prompt 里的手机号先脱敏；judge 失败返回 `score: null` 并在 comment 标 `judge_error`，不拖垮机制门禁。`out/eval-smith-baseline.json` 是 judge 基线，`EVAL_SMITH_STRICT=true` 时低于基线退出 1。评测并发固定为 1（共享 PGlite 单 IO），真实模型超时单独放宽到 90s，避免把基础设施抖动误判成能力退化。报告在 `out/eval-smith-report-*.json`，含每条 case 的 feedback 与 traceId，可在 LangSmith 按 feedback key 筛选、跨 experiment 比较。
+judge 用 **Jev（TypeSafe System One 决策模型）**，经 LangSmith LLM Gateway 调用：本地只持有 `LANGSMITH_API_KEY`，TypeSafe key 存 workspace secret `TYPESAFE_API_KEY`（免费 Developer 档即可）。question 名即 feedback key，Smith 在线 evaluator 复用同名同模型，离线 / 在线分数可直接并排比。state 拼装时手机号先脱敏，且不带 `identity` / `systemText`；judge 失败返回 `score: null` 并在 comment 标 `judge_error`，不拖垮机制门禁。`out/eval-smith-baseline.json` 是 judge 基线，`EVAL_SMITH_STRICT=true` 时低于基线退出 1；`judge_pii_leak` 是反向指标，单独要求均值 < 0.5。评测并发固定为 1（共享 PGlite 单 IO），真实模型超时单独放宽到 90s，避免把基础设施抖动误判成能力退化。报告在 `out/eval-smith-report-*.json`，含每条 case 的 feedback 与 traceId，可在 LangSmith 按 feedback key 筛选、跨 experiment 比较。
 
 ### 6. RAG
 

@@ -1,5 +1,10 @@
 const $ = (id) => document.getElementById(id);
-const state = { sessionId: "", last: null, pending: null, health: null };
+// 会话 ID 落到 localStorage：刷新页面仍续接同一条线程，但不会退化成共享的空 thread_id。
+const SESSION_KEY = "agent_harness_gongdan_session_id";
+const state = {
+  sessionId: localStorage.getItem(SESSION_KEY) ?? "",
+  last: null, pending: null, health: null,
+};
 
 const SCENARIOS = [
   { label: "政策咨询", hint: "RAG 引用链", text: "耳机保修期多久？左耳没声音该怎么处理？" },
@@ -140,6 +145,7 @@ async function send() {
     if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
     state.last = data;
     state.sessionId = data.sessionId;
+    localStorage.setItem(SESSION_KEY, data.sessionId);
     $("traceHint").textContent = `trace ${String(data.traceId).slice(0, 8)} · LangSmith`;
 
     addMessage("Agent", data.answer ?? "", data.verdict === "rejected" ? "reject" : "ai");
@@ -208,7 +214,7 @@ function renderAll(data) {
   renderAudit(data.audit ?? []);
   renderRag(data.rag);
   renderContext(data.contextReport);
-  renderSecurity(data.audit ?? [], data);
+  renderLayers(data.audit ?? []);
   renderDecisions(data.audit ?? []);
 }
 
