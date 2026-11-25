@@ -2,6 +2,13 @@ const $ = (id) => document.getElementById(id);
 // 会话 ID 落到 localStorage：刷新页面仍续接同一条线程，但不会退化成共享的空 thread_id。
 const SESSION_KEY = "agent_harness_gongdan_session_id";
 const ONBOARD_KEY = "agent_harness_gongdan_onboarded";
+// 观摩用：?resetGuide=1 清掉「已看过」标记并还原干净 URL，不影响正常访问。
+if (new URLSearchParams(location.search).get("resetGuide") === "1") {
+  localStorage.removeItem(ONBOARD_KEY);
+  const clean = new URL(location.href);
+  clean.searchParams.delete("resetGuide");
+  history.replaceState(null, "", clean);
+}
 const state = {
   sessionId: localStorage.getItem(SESSION_KEY) ?? "",
   last: null, pending: null, health: null,
