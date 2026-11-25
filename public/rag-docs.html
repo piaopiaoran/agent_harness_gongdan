@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RAG 知识库文档 · agent_harness_gongdan</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="docs-page">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">AG</span>
+      <div>
+        <h1>RAG 知识库文档</h1>
+        <p>当前租户的全部生效文档 · 按 chunk 顺序展示原文</p>
+      </div>
+    </div>
+    <div class="runtime" id="runtime"><span class="badge">加载中…</span></div>
+  </header>
+
+  <main class="docs-layout">
+    <aside class="panel docs-nav">
+      <section class="block">
+        <h2>筛选</h2>
+        <label class="field-label" for="tenantId">tenant_id</label>
+        <input class="input" id="tenantId" value="tenant-a" autocomplete="off">
+        <label class="field-label" for="filter">搜索标题 / 路径 / 正文</label>
+        <input class="input" id="filter" placeholder="例如：保修期" autocomplete="off">
+        <p class="hint-block">数据来自只读接口 <code>/api/rag/documents</code>，仅显示当前租户的 active 版本；旧版本与失效 chunk 不展示。</p>
+        <button class="btn mini" id="refresh">刷新</button>
+      </section>
+      <section class="block">
+        <h2>文档目录 <span class="hint" id="count"></span></h2>
+        <div class="toc" id="toc"></div>
+      </section>
+    </aside>
+
+    <section class="panel docs-content">
+      <div id="docs"><p class="empty">加载中…</p></div>
+    </section>
+  </main>
+
+  <script type="module" src="/rag-docs.js"></script>
+</body>
+</html>

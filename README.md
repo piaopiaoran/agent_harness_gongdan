@@ -27,10 +27,12 @@ npm start           # http://localhost:3204
 | `npm run smoke` | 9 项端到端冒烟（fake 模型，不依赖外部 API） |
 | `npm run eval` | 离线评测门禁（默认 fake 机制集；`EVAL_LLM=real` 跑真实模型） |
 | `npm run eval:smith` | LangSmith 自动化评测：dataset + experiment + code 断言 + Jev judge |
-| `npm test` | 15 项纯单元测试（含 Jev golden gating，不连库、不调模型） |
+| `npm test` | 22 项纯单元测试（含 Jev golden gating、知识库目录映射，不连库、不调模型） |
 | `npm run db:check` | 列出本项目所有带前缀的数据库对象 |
 | `npm run check:llm` | 校验 LLM / Embedding 端点与维度 |
 | `npm run check:smith` | 校验 LangSmith key、项目 run 数，并给出最近一条 trace 链接 |
+
+> 控制台右侧「RAG」标签页底部有**知识库文档入口**，点击在新标签页打开 `/rag-docs.html?tenant=...`：按当前 tenant 展示全部生效文档与 chunk 原文，支持搜索与目录跳转（只读 `GET /api/rag/documents`，与对话证据同源）。
 
 > 离线评测看不懂？先看 **[docs/离线评测说明.md](docs/离线评测说明.md)**：两条评测路径的区别、分数怎么来的、golden 为什么只在 referenceOutputs、门禁口径与常见坑，都按「第一次接触」的顺序讲。
 

@@ -36,12 +36,14 @@
 
       <section class="block">
         <h2>预设场景</h2>
+        <p class="scenario-tip" id="scenarioTip">第一次进来？点「政策咨询」这个按钮，就能完整走一遍查文档 → 出答案的链路。</p>
         <div id="scenarios" class="scenarios"></div>
       </section>
 
       <section class="block">
         <h2>Harness 六层</h2>
         <div class="modules" id="modules"></div>
+        <p class="hint-block">L1–L10 是安全防线编号（Layer），不是模型层数。右侧「执行链 / 安全」标签里有逐条的人话解释。</p>
       </section>
 
       <section class="block">
@@ -59,7 +61,7 @@
       <div class="messages" id="messages">
         <div class="msg system">
           <div class="msg-label">引导</div>
-          <div class="msg-body">试试左侧场景：政策咨询会走完整 RAG 引用链；退款请求会触发人工审批闸门；注入攻击会被 L3 fail-close 拦截。</div>
+          <div class="msg-body">试试左侧场景：政策咨询会查文档并给出处；退款请求会停在人工审批；注入攻击会被输入护栏（L3）直接拦截。</div>
         </div>
       </div>
       <div class="approval" id="approval" hidden></div>
@@ -79,12 +81,13 @@
         <button class="tab" data-tab="memory">记忆</button>
         <button class="tab" data-tab="context">上下文</button>
         <button class="tab" data-tab="security">安全</button>
-        <button class="tab" data-tab="learn">讲解</button>
         <button class="tab" data-tab="eval">评测</button>
+        <button class="tab" data-tab="learn">讲解</button>
       </div>
 
       <div class="tab-panel" id="tab-pipeline">
-        <div class="flow" id="flow"></div>
+        <h3>执行链 <span class="hint">4 段故事 / 11 步 · L = 防线编号，不是模型层数</span></h3>
+        <div id="flow"></div>
         <h3>审计时间线 <span class="hint">点击节点看详情</span></h3>
         <div class="audit" id="audit"></div>
       </div>
@@ -96,6 +99,12 @@
         <div class="degradations" id="degradations"></div>
         <h3>证据块（强制引用）</h3>
         <div class="evidence" id="evidence"></div>
+        <h3>知识库文档 <span class="hint">全文在新页面</span></h3>
+        <div class="doc-entry">
+          <a class="btn primary" id="ragDocsOpen" href="/rag-docs.html" target="_blank" rel="noopener">打开知识库文档库 ↗</a>
+          <span class="hint" id="ragDocCount">统计中…</span>
+        </div>
+        <p class="hint-block">新标签页按当前租户展示全部生效文档与 chunk 原文，支持搜索与目录跳转。数据来自只读接口 <code>/api/rag/documents</code>，与上方证据块同源。</p>
       </div>
 
       <div class="tab-panel" id="tab-memory" hidden>
@@ -115,7 +124,12 @@
       </div>
 
       <div class="tab-panel" id="tab-security" hidden>
-        <h3>L1–L10 防线地图</h3>
+        <div class="primer">
+          <div class="primer-head">L1–L10 是什么 <span class="hint">L = Layer（防线编号），不是模型层数</span></div>
+          <div><b>一句话：</b>从「进得来」到「查得对」「调得稳」「说得安全」的十道关卡，编号约等于请求经过的顺序。</div>
+          <div><b>面试讲法：</b>挡坏输入（L1–L3）→ 检索不越权（L4）→ 工具不越权（L5–L6）→ 输出不泄密（L7）→ 全程可回查（L10）。</div>
+        </div>
+        <h3>L1–L10 防线地图 <span class="hint">每条先给人话，再给实现</span></h3>
         <div class="layers" id="layers"></div>
         <h3>本次决策</h3>
         <div class="decisions" id="decisions"></div>

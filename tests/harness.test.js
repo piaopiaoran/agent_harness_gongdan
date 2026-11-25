@@ -18,6 +18,7 @@ import {
   buildJudgeInput,
 } from "../src/eval/judge.js";
 import { buildEvalDashboard } from "../src/eval/dashboard.js";
+import { buildDocumentCatalog } from "../src/rag/catalog.js";
 
 test("分词保留词典专名与英文数字连续 token", () => {
   const tokens = segment("ORD-1001 左耳无声音，申请七天无理由退货");
@@ -292,4 +293,32 @@ test("评测看板：空数据返回空 series 而不是抛错", () => {
   assert.equal(d.count, 0);
   assert.equal(d.latest, null);
   assert.deepEqual(d.series, []);
+});
+
+test("知识库目录：chunk 按文档分组、按 chunk_idx 排序，孤立 chunk 不展示", () => {
+  const documents = [
+    { id: "d-b", source: "b.md", title: "B", version: 2, created_at: "2026-11-25T10:00:00Z" },
+    { id: "d-a", source: "a.md", title: "A", version: 1, acl: ["support"], created_at: "2026-11-24T10:00:00Z" },
+  ];
+  const chunks = [
+    { id: "c2", doc_id: "d-a", chunk_idx: 2, content: "尾", tokens: 3 },
+    { id: "c1", doc_id: "d-a", chunk_idx: 0, content: "头", tokens: 2 },
+    { id: "cx", doc_id: "d-ghost", chunk_idx: 0, content: "孤立", tokens: 1 },
+  ];
+  const cat = buildDocumentCatalog(documents, chunks);
+  assert.equal(cat.count, 2);
+  assert.equal(cat.chunkCount, 2);
+  assert.deepEqual(cat.documents.map((d) => d.source), ["a.md", "b.md"]);
+  assert.deepEqual(cat.documents[0].chunks.map((c) => c.chunkIdx), [0, 2]);
+  assert.deepEqual(cat.documents[0].acl, ["support"]);
+  assert.equal(cat.documents[1].chunks.length, 0);
+});
+
+test("知识库目录：空数据返回空列表，同 source 多版本按版本降序", () => {
+  assert.deepEqual(buildDocumentCatalog(), { count: 0, chunkCount: 0, documents: [] });
+  const cat = buildDocumentCatalog([
+    { id: "old", source: "a.md", title: "A", version: 1 },
+    { id: "new", source: "a.md", title: "A", version: 2 },
+  ], []);
+  assert.deepEqual(cat.documents.map((d) => d.id), ["new", "old"]);
 });

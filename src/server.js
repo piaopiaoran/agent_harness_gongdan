@@ -4,8 +4,9 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import { config, PREFIX } from "./config.js";
 import { createRuntime, createSession, extractInterrupt } from "./runtime.js";
-import { listAudit, listEvalRuns, listFacts, searchEpisodes } from "./db/queries.js";
+import { listAudit, listEvalRuns, listFacts, listRagDocuments, searchEpisodes } from "./db/queries.js";
 import { buildEvalDashboard } from "./eval/dashboard.js";
+import { buildDocumentCatalog } from "./rag/catalog.js";
 import { getPool } from "./db/pool.js";
 import { createEmbedder } from "./llm/embedding.js";
 import { flushTraces, logTracingStatus, tracingStatus } from "./observability/tracing.js";
@@ -162,6 +163,24 @@ export function buildApp(runtime) {
       });
     } catch (err) {
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  /** 只读知识库目录：tenant 从身份头注入，SQL 层 active + tenant 双过滤。 */
+  app.get("/api/rag/documents", async (req, res) => {
+    const tenantId = String(req.get("x-tenant-id") ?? "tenant-a");
+    try {
+      const { documents, chunks } = await listRagDocuments({ tenantId });
+      res.json({
+        ...buildDocumentCatalog(documents, chunks),
+        tenantId,
+        generatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      res.status(503).json({
+        error: "rag_store_unavailable",
+        message: String(err.message ?? "").slice(0, 200),
+      });
     }
   });
 

@@ -158,6 +158,30 @@ export async function getDocumentTitles({ tenantId, ids }) {
   )).then((r) => new Map(r.rows.map((d) => [d.id, d])));
 }
 
+/**
+ * 知识库文档目录（只读）：只暴露当前租户的 active 版本文档与其 active chunks。
+ * 不查 search_text / tsv / embedding：这些是检索内部数据，对前端没有展示价值且体积大。
+ */
+export async function listRagDocuments({ tenantId, limit = 50, chunkLimit = 200 }) {
+  const documents = await withTenant(tenantId, (c) => c.query(
+    `SELECT id, source, title, version, acl, created_at
+       FROM ${T.ragDocuments}
+      WHERE tenant_id = $1 AND active = true
+      ORDER BY source ASC, version DESC LIMIT $2`,
+    [tenantId, limit]
+  )).then((r) => r.rows);
+  if (!documents.length) return { documents: [], chunks: [] };
+
+  const chunks = await withTenant(tenantId, (c) => c.query(
+    `SELECT id, doc_id, chunk_idx, content, tokens, created_at
+       FROM ${T.ragChunks}
+      WHERE tenant_id = $1 AND active = true AND doc_id = ANY($2::uuid[])
+      ORDER BY doc_id, chunk_idx LIMIT $3`,
+    [tenantId, documents.map((d) => d.id), chunkLimit]
+  )).then((r) => r.rows);
+  return { documents, chunks };
+}
+
 /** 向量路：HNSW 余弦距离，tenant 条件下推（RLS 之外再显式过滤一次，双保险）。 */
 export async function vectorSearchChunks({ tenantId, embedding, limit = 30 }) {
   return withTenant(tenantId, (c) => c.query(
