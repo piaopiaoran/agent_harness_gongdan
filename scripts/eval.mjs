@@ -2,8 +2,9 @@ import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 /**
- * 离线评测门禁（LangSmith 是底座，Judge 复用内置能力；这里是本地可复现的确定性基线）。
- * 默认用 fake 模型评测「Harness 机制」；语义质量门禁请跑 EVAL_LLM=real npm run eval。
+ * 离线评测门禁（本地可复现的确定性基线）：只跑代码硬断言，不调用 Jev judge。
+ * 默认用 fake 模型评测「Harness 机制」；EVAL_LLM=real 只换成真实模型，仍然只跑断言。
+ * 语义质量评分（Jev 的 8 个指标）请跑 npm run eval:smith，本脚本不具备该能力。
  * 评测与线上共用同一张图，但关闭 checkpointer 与异步蒸馏，避免 case 之间串状态。
  */
 if (process.env.EVAL_LLM !== "real") {

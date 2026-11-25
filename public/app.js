@@ -126,6 +126,8 @@ async function boot() {
 function switchTab(name) {
   for (const t of document.querySelectorAll(".tab")) t.classList.toggle("active", t.dataset.tab === name);
   for (const p of document.querySelectorAll(".tab-panel")) p.hidden = p.id !== `tab-${name}`;
+  // 评测数据按需加载：不阻塞对话页，也不在每次发消息时重复拉取。
+  if (name === "eval") refreshEvalDashboard();
 }
 
 async function send() {
@@ -349,6 +351,131 @@ async function refreshInspect() {
   } catch { /* 检视失败不阻塞对话 */ }
 }
 
+// ---------------------------------------------------------------------------
+// 评测看板：只读 /api/evals，数据与对话页解耦。
+// ---------------------------------------------------------------------------
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function fmtValue(v) {
+  return v === null || v === undefined || !Number.isFinite(Number(v)) ? "—" : Number(v).toFixed(3);
+}
+
+function fmtTime(v) {
+  if (!v) return "—";
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString("zh-CN", { hour12: false });
+}
+
+function sparkline(points, baseline) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 108 28");
+  svg.setAttribute("class", "spark");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "指标趋势");
+  if (!points.length) return svg;
+
+  const values = points.map((p) => p.value);
+  const lo = Math.min(...values, baseline ?? Infinity);
+  const hi = Math.max(...values, baseline ?? -Infinity);
+  const span = hi - lo;
+  const y = (v) => span < 1e-9 ? 14 : 25 - ((v - lo) / span) * 22;
+  const x = (i) => 2 + (i * 104) / Math.max(1, points.length - 1);
+
+  if (baseline !== null && baseline !== undefined && Number.isFinite(baseline)) {
+    const line = document.createElementNS(SVG_NS, "line");
+    line.setAttribute("x1", "2"); line.setAttribute("x2", "106");
+    line.setAttribute("y1", String(y(baseline))); line.setAttribute("y2", String(y(baseline)));
+    line.setAttribute("class", "spark-base");
+    svg.append(line);
+  }
+  const poly = document.createElementNS(SVG_NS, "polyline");
+  poly.setAttribute("points", points.map((p, i) => `${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(" "));
+  poly.setAttribute("class", "spark-line");
+  svg.append(poly);
+  const last = document.createElementNS(SVG_NS, "circle");
+  last.setAttribute("cx", String(x(points.length - 1)));
+  last.setAttribute("cy", String(y(points[points.length - 1].value)));
+  last.setAttribute("r", "2.4");
+  last.setAttribute("class", "spark-dot");
+  svg.append(last);
+  return svg;
+}
+
+function renderMetricRow(s) {
+  const row = el("div", "metric-row");
+  const h = el("div", "metric-head");
+  h.append(el("span", "metric-key", s.key), el("span", "metric-value", fmtValue(s.latest)));
+  const delta = s.delta === null ? "—"
+    : `${s.delta > 0 ? "+" : ""}${s.delta.toFixed(3)}`;
+  const deltaCls = s.delta === null || s.delta === 0
+    ? "muted" : (s.improved ? "good" : "bad");
+  h.append(el("span", `metric-delta ${deltaCls}`, delta));
+  const chart = el("div", "metric-chart");
+  chart.append(sparkline(s.points, s.baseline));
+  if (s.reverse) chart.append(el("small", "", "越低越好"));
+  if (s.baseline !== null && s.baseline !== undefined) chart.append(el("small", "", `基线 ${fmtValue(s.baseline)}`));
+  row.append(h, chart);
+  return row;
+}
+
+function renderEvalDashboard(data) {
+  const summary = $("evalSummary");
+  const seriesBox = $("evalSeries");
+  const runsBox = $("evalRuns");
+  summary.replaceChildren();
+  seriesBox.replaceChildren();
+  runsBox.replaceChildren();
+
+  if (!data.count) {
+    summary.append(el("p", "empty", "暂无评测记录 · 运行 npm run eval:smith 后刷新"));
+    return;
+  }
+  const latest = data.latest;
+  const head = el("div", "eval-latest");
+  head.append(el("b", "", latest.runName),
+    el("span", `state ${latest.passed ? "pass" : "fail"}`, latest.passed ? "通过门禁" : "未过门禁"));
+  summary.append(head, el("div", "eval-meta", `${fmtTime(latest.createdAt)} · ${latest.dataset} · 共 ${data.count} 次`));
+
+  // 两条评测路径的 overall 含义不同，按轨分组渲染，delta 与基线各算各的。
+  for (const g of data.groups ?? []) {
+    const box = el("section", "eval-group");
+    const gh = el("div", "eval-group-head");
+    gh.append(el("b", "", g.label),
+      el("span", "eval-group-count", `${g.count} 次 · 最近 ${fmtTime(g.latest?.createdAt)}`));
+    box.append(gh, el("p", "eval-group-hint", g.hint));
+    if (!(g.series ?? []).length) box.append(el("p", "empty", "该路径暂无指标分数"));
+    for (const s of g.series ?? []) box.append(renderMetricRow(s));
+    seriesBox.append(box);
+  }
+
+  for (const g of data.groups ?? []) {
+    runsBox.append(el("div", "eval-run-track", `${g.label}（${g.count} 次）`));
+    for (const r of g.runs ?? []) {
+      const row = el("div", "eval-run");
+      row.append(el("span", "run-time", fmtTime(r.createdAt)), el("b", "", r.runName));
+      const overallLabel = g.id === "smith" ? "overall·3项均值" : "overall·通过率";
+      row.append(el("span", "run-meta", `${r.dataset} · ${overallLabel} ${fmtValue(r.metrics?.overall)}`));
+      row.append(el("span", `state ${r.passed ? "pass" : "fail"}`, r.passed ? "PASS" : "FAIL"));
+      runsBox.append(row);
+    }
+  }
+}
+
+async function refreshEvalDashboard() {
+  const box = $("evalSummary");
+  box.replaceChildren(el("p", "empty", "加载中…"));
+  try {
+    const res = await fetch("/api/evals?limit=12");
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message ?? data.error ?? `HTTP ${res.status}`);
+    renderEvalDashboard(data);
+  } catch (err) {
+    box.replaceChildren(el("p", "empty", `评测数据不可用：${err.message}`));
+    $("evalSeries").replaceChildren();
+    $("evalRuns").replaceChildren();
+  }
+}
+
 function renderLearn() {
   const box = $("learn");
   const sections = [
@@ -356,7 +483,7 @@ function renderLearn() {
     ["上下文为什么要 Headroom？", `<p>所有片段共享一个窗口，配额是软上限。生成、工具返回膨胀、运行时追加都会吃 token。预留 30%–40% 后，超窗口先丢低相似度记忆，再压远端摘要，最后才动近程原文；系统指令不动。</p>`],
     ["安全为什么挂在图上而不是 prompt 里？", `<p>模型输出 tool_call 只是请求。L5 网关做 RBAC / 白名单 / 参数校验，高危动作走 <code>interrupt()</code> 人工审批，审批人必须独立。换模型供应商时，这些防线一行都不用改。</p>`],
     ["RAG 为什么双路召回 + 精排？", `<p>bge-m3 向量路擅长语义，jieba 风格关键词路擅长型号 / 订单号 / 专名。两路各取 30 条走 RRF(k=60)，前 20 进精排，阈值 0.30 后留 6 块证据。证据不足时拒答，不编造。</p>`],
-    ["自动化评测为什么既用断言又用 judge？", `<p><code>npm run eval:smith</code> 会把评测集同步成 LangSmith dataset，跑 experiment：code 评测器判机制硬断言（引用 / 工具白名单 / PII / 审批），LLM judge 判语义软质量（忠实度 / 决策合理性，默认 <code>deepseek-chat</code>）。分数作为 feedback 写回平台，可按 key 筛选、跨版本对比。硬断言 fail-close，judge fail-open，避免把模型抖动当门禁。</p>`],
+    ["自动化评测为什么既用断言又用 judge？", `<p><code>npm run eval:smith</code> 会把评测集同步成 LangSmith dataset，跑 experiment：code 评测器判机制硬断言（引用 / 工具白名单 / PII / 审批），LLM judge 判语义软质量（忠实度 / 决策合理性，默认 <code>jev-latest</code>）。分数作为 feedback 写回平台，可按 key 筛选、跨版本对比。硬断言 fail-close，judge fail-open，避免把模型抖动当门禁。</p>`],
     ["为什么 fail-close / fail-open 要分开？", `<p>越权、PII、无证据作答一律 fail-close；精排、内容护栏、审计这类质量增强组件 fail-open 加告警。全 fail-close 会把可用性拖垮，全 fail-open 会把风险放出去。</p>`],
     ["共享 PGlite 的坑", `<p>底层单实例，同一时刻只能处理一个 IO，连接池必须用 max=1；否则 checkpoint 写入与审计并发时会出现 “unnamed prepared statement does not exist”。真实 PostgreSQL 可调大连接池。</p>`],
   ];
@@ -370,6 +497,7 @@ function renderLearn() {
 }
 
 $("send").onclick = send;
+$("evalRefresh").onclick = refreshEvalDashboard;
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send();
 });

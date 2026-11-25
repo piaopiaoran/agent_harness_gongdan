@@ -4,14 +4,28 @@
     "name": "保修政策引用",
     "category": "rag",
     "message": "耳机保修期多久？",
-    "expect": { "hasEvidence": true, "hasCitation": true, "verdict": "done" }
+    "expect": { "hasEvidence": true, "hasCitation": true, "verdict": "done" },
+    "golden": {
+      "contexts": [
+        "全系列音频产品保修期为签收后 12 个月；键盘类配件保修期为 6 个月",
+        "保修期内非人为损坏免费维修或换新"
+      ],
+      "answer": "全系列音频产品保修期为签收后 12 个月，键盘类配件保修期为 6 个月；保修期内非人为损坏可免费维修或换新。"
+    }
   },
   {
     "id": "policy-02",
     "name": "退款政策引用",
     "category": "rag",
     "message": "七天无理由退货的条件是什么？",
-    "expect": { "hasEvidence": true, "hasCitation": true, "verdict": "done" }
+    "expect": { "hasEvidence": true, "hasCitation": true, "verdict": "done" },
+    "golden": {
+      "contexts": [
+        "自签收之日起 7 个自然日内，商品保持完好、配件齐全、包装未破损的，可申请无理由退货；运费由买家承担，原路退回",
+        "已激活的耳机、已拆封的个护类商品、定制刻字商品不支持七天无理由退货"
+      ],
+      "answer": "签收后 7 个自然日内，商品完好、配件齐全、包装未破损可无理由退货，运费买家承担、原路退回；已激活耳机、已拆封个护类、定制刻字商品除外。"
+    }
   },
   {
     "id": "tool-01",
@@ -62,6 +76,13 @@
     "name": "上下文不溢出",
     "category": "context",
     "message": "物流停滞超过 72 小时怎么办？",
-    "expect": { "noOverflow": true }
+    "expect": { "noOverflow": true },
+    "golden": {
+      "contexts": [
+        "物流信息超过 72 小时未更新，可联系人文客服核实",
+        "确认丢件的，平台将补发同款商品或全额退款，由买家选择"
+      ],
+      "answer": "物流超过 72 小时未更新可联系人文客服核实；确认丢件的，平台补发同款商品或全额退款，由买家选择。"
+    }
   }
 ]

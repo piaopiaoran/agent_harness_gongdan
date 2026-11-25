@@ -212,6 +212,53 @@ body {
 .learn ul { padding-left: 18px; margin: 4px 0; }
 .learn code { background: #eef1f7; padding: 1px 4px; border-radius: 4px; font-size: 11px; }
 
+/* 评测看板 */
+.eval-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.eval-head h3 { margin-top: 0; }
+.btn.mini { font-size: 11px; padding: 4px 9px; }
+.eval-latest { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 12px; }
+.eval-meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.eval-latest .state, .eval-run .state {
+  font-size: 10px; border-radius: 4px; padding: 1px 6px;
+  background: var(--green-soft); color: var(--green); white-space: nowrap;
+}
+.eval-latest .state.fail, .eval-run .state.fail { background: var(--red-soft); color: var(--red); }
+.eval-group {
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 9px;
+  margin-bottom: 10px; background: #fff;
+}
+.eval-group-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 12px; }
+.eval-group-count { font-size: 10px; color: var(--muted); white-space: nowrap; }
+.eval-group-hint { font-size: 10px; color: var(--muted); margin: 3px 0 7px; }
+.eval-run-track {
+  font-size: 11px; font-weight: 600; color: var(--accent);
+  padding: 8px 0 3px; border-bottom: 1px solid var(--line);
+}
+.metric-row {
+  border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px;
+  margin-bottom: 6px; background: #fbfcfe;
+}
+.metric-head { display: flex; align-items: baseline; gap: 6px; font-size: 11px; }
+.metric-key { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.metric-value { font-variant-numeric: tabular-nums; font-weight: 700; }
+.metric-delta { font-size: 10px; font-variant-numeric: tabular-nums; }
+.metric-delta.good { color: var(--green); }
+.metric-delta.bad { color: var(--red); }
+.metric-delta.muted { color: var(--muted); }
+.metric-chart { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+.metric-chart small { color: var(--muted); font-size: 10px; }
+.spark { width: 108px; height: 28px; flex: none; }
+.spark-line { fill: none; stroke: var(--accent); stroke-width: 1.6; }
+.spark-dot { fill: var(--accent); }
+.spark-base { stroke: #d0d5dd; stroke-width: 1; stroke-dasharray: 3 2; }
+.eval-run {
+  display: grid; grid-template-columns: 1fr auto; gap: 2px 8px;
+  border-bottom: 1px solid var(--line); padding: 6px 0; font-size: 11px;
+}
+.eval-run .run-time { color: var(--muted); font-size: 10px; }
+.eval-run .run-meta { color: var(--muted); font-size: 10px; }
+.eval-run .state { grid-column: 2; grid-row: 1 / span 3; align-self: center; }
+
 @media (max-width: 1180px) {
   .layout { grid-template-columns: 230px 1fr; height: auto; }
   .inspect { grid-column: 1 / -1; max-height: 620px; }

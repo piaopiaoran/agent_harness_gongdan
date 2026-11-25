@@ -17,7 +17,9 @@ const client = new Client({ apiKey: key, apiUrl: config.langsmith.endpoint });
 const api = client.openAPIClient;
 const unwrap = (res) => res?.body ?? res;
 
-const KEYS = ["judge_decision", "judge_faithfulness"];
+// 只列 reference-free 的在线 evaluator：golden 类（recall / correctness）离线专属，
+// 在线 trace 没有标准答案，不会出现同名 feedback。
+const KEYS = ["judge_decision", "judge_faithfulness", "judge_context_precision"];
 
 try {
   const projects = unwrap(await api.sessions.listV2({ limit: 50 }));

@@ -80,6 +80,7 @@
         <button class="tab" data-tab="context">上下文</button>
         <button class="tab" data-tab="security">安全</button>
         <button class="tab" data-tab="learn">讲解</button>
+        <button class="tab" data-tab="eval">评测</button>
       </div>
 
       <div class="tab-panel" id="tab-pipeline">
@@ -122,6 +123,19 @@
 
       <div class="tab-panel" id="tab-learn" hidden>
         <div class="learn" id="learn"></div>
+      </div>
+
+      <div class="tab-panel" id="tab-eval" hidden>
+        <div class="eval-head">
+          <h3>离线评测 · 趋势</h3>
+          <button class="btn mini" id="evalRefresh">刷新</button>
+        </div>
+        <div class="eval-summary" id="evalSummary"><p class="empty">切换至此标签时加载…</p></div>
+        <h3>指标走势 <span class="hint">按评测路径分组 · 左→右为时间正序</span></h3>
+        <div class="eval-series" id="evalSeries"></div>
+        <h3>最近批次</h3>
+        <div class="eval-runs" id="evalRuns"></div>
+        <p class="hint-block">数据读自本地 eval_runs 表（离线 experiment 产物）。两条路径的 overall 含义不同（eval:smith = 3 项均值；npm run eval = 用例通过率），已分开统计，不跨路径算 delta。在线 judge 分数在 LangSmith trace 的 Feedback 里看，不要混算。</p>
       </div>
     </aside>
   </main>

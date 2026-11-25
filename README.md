@@ -27,10 +27,12 @@ npm start           # http://localhost:3204
 | `npm run smoke` | 9 项端到端冒烟（fake 模型，不依赖外部 API） |
 | `npm run eval` | 离线评测门禁（默认 fake 机制集；`EVAL_LLM=real` 跑真实模型） |
 | `npm run eval:smith` | LangSmith 自动化评测：dataset + experiment + code 断言 + Jev judge |
-| `npm test` | 9 项纯单元测试（不连库、不调模型） |
+| `npm test` | 15 项纯单元测试（含 Jev golden gating，不连库、不调模型） |
 | `npm run db:check` | 列出本项目所有带前缀的数据库对象 |
 | `npm run check:llm` | 校验 LLM / Embedding 端点与维度 |
 | `npm run check:smith` | 校验 LangSmith key、项目 run 数，并给出最近一条 trace 链接 |
+
+> 离线评测看不懂？先看 **[docs/离线评测说明.md](docs/离线评测说明.md)**：两条评测路径的区别、分数怎么来的、golden 为什么只在 referenceOutputs、门禁口径与常见坑，都按「第一次接触」的顺序讲。
 
 前置服务：本机共享 PGlite（`127.0.0.1:5432/postgres`，已装 pgvector）与 Redis 8。
 真实密钥只写在本地 `.env`（已被 `.gitignore` 排除），`.env.example` 是脱敏模板。
@@ -68,7 +70,7 @@ npm start           # http://localhost:3204
 | 上下文 | `src/context/assemble.js` | 6 区块软上限、优先级裁剪、来源标注、Headroom |
 | 安全 | `src/security/`, `src/graph/nodes.js` | L1–L10 挂在节点与条件边上 |
 | 并发 | `src/security/rateLimit.js`, `src/queue/priority.js` | Redis 限流 + ZSET 优先级队列 |
-| 评测 | `scripts/eval.mjs`, `data/eval-cases.json` | 9 条用例、分类指标、基线门禁、DB 留档 |
+| 评测 | `scripts/eval.mjs`, `scripts/eval-smith.mjs`, `src/eval/judge.js`, `src/eval/dashboard.js`, `data/eval-cases.json` | 9 条用例、分类指标、Jev typed questions（含 golden gating）、基线门禁、DB 留档、看板趋势聚合 |
 | RAG | `src/rag/`, `data/docs/` | 分词、双路召回、RRF、精排、证据拼装 |
 | 可观测 | `src/observability/tracing.js` | LangSmith trace 配置与最小披露 metadata |
 
@@ -144,8 +146,30 @@ npm start           # http://localhost:3204
 | `judge_task_completed` | Jev · noul | 是否真正完成请求，而非只解释或绕开 | fail-open，仅告警 |
 | `judge_helpfulness` | Jev · score（0–4 有序量表） | 回答对用户解决问题的有用程度 | fail-open，仅告警 |
 | `judge_pii_leak` | Jev · noul（**反向**，高分 = 异常） | 回答是否泄露未脱敏的个人标识 | fail-open + 门禁单独校验 |
+| `judge_context_precision` | Jev · noul | 检索证据是否都切题、无明显噪声（**reference-free**，在线/离线都能跑） | fail-open，仅告警 |
+| `judge_context_recall` | Jev · noul | 回答所需关键点是否**都被检索到**（需 golden，仅离线） | 无标注 case 返回 `null` |
+| `judge_answer_correctness` | Jev · noul | 最终回答关键事实是否与标准答案一致（需 golden，仅离线） | 无标注 case 返回 `null` |
 
-judge 用 **Jev（TypeSafe System One 决策模型）**，经 LangSmith LLM Gateway 调用：本地只持有 `LANGSMITH_API_KEY`，TypeSafe key 存 workspace secret `TYPESAFE_API_KEY`（免费 Developer 档即可）。question 名即 feedback key，Smith 在线 evaluator 复用同名同模型，离线 / 在线分数可直接并排比。state 拼装时手机号先脱敏，且不带 `identity` / `systemText`；judge 失败返回 `score: null` 并在 comment 标 `judge_error`，不拖垮机制门禁。`out/eval-smith-baseline.json` 是 judge 基线，`EVAL_SMITH_STRICT=true` 时低于基线退出 1；`judge_pii_leak` 是反向指标，单独要求均值 < 0.5。评测并发固定为 1（共享 PGlite 单 IO），真实模型超时单独放宽到 90s，避免把基础设施抖动误判成能力退化。报告在 `out/eval-smith-report-*.json`，含每条 case 的 feedback 与 traceId，可在 LangSmith 按 feedback key 筛选、跨 experiment 比较。
+judge 用 **Jev（TypeSafe System One 决策模型）**，直连 TypeSafe：本地 `.env` 的 `JUDGE_API_KEY` 与 Smith workspace secret `TYPESAFE_API_KEY` 是同一把 key，模型同为 `jev-latest`（在线 evaluator 页面显示 `jev-latest`，SDK 里模型名不带 `typesafe/` 前缀）。question 名即 feedback key，离线 / 在线分数可直接并排比。旧版 LangSmith Gateway 通道已弃用，`LANGSMITH_GATEWAY_BASE_URL` 仅为兼容保留。判据集中在 `src/eval/judge.js`：`REFERENCE_FREE_QUESTIONS`（6 项，只需 inputs + outputs）与 `GOLDEN_QUESTIONS`（2 项，需 `referenceOutputs.golden`）。state 拼装时手机号先脱敏，且不带 `identity` / `systemText`；judge 失败返回 `score: null` 并在 comment 标 `judge_error`，不拖垮机制门禁。`out/eval-smith-baseline.json` 是 judge 基线，`EVAL_SMITH_STRICT=true` 时低于基线退出 1；`judge_pii_leak` 是反向指标，单独要求均值 < 0.5。评测并发固定为 1（共享 PGlite 单 IO），真实模型超时单独放宽到 90s，避免把基础设施抖动误判成能力退化。报告在 `out/eval-smith-report-*.json`，含每条 case 的 feedback、traceId 与 goldenCoverage，可在 LangSmith 按 feedback key 筛选、跨 experiment 比较。
+
+**本地评测看板**：右侧面板新增「评测」tab（`public/index.html` / `public/app.js`），首次切到该 tab 才请求 `GET /api/evals?limit=12`，不阻塞对话页。后端只读 `eval_runs` 表，`src/eval/dashboard.js` 按 `runName` / 指标集合把历史行分成 **eval:smith** 与 **npm run eval** 两轨，分别出指标趋势（时间正序的 sparkline + 与上一轮的 delta + 基线虚线）；两条路径的 `overall` 含义不同（3 项均值 vs 用例通过率），**不跨轨算 delta**，`judge_pii_leak` 按「越低越好」判改善。看板定位是**发版前的回归诊断**，不是把分数塞进对话页；在线 judge 分数仍要去 LangSmith trace 的 Feedback 看，两者口径不同不要混算。接口只读且有 limit 上限，DB 不可用时返回 503 而不是伪造数据。
+
+**RAG 指标为什么要分两组**：`faithfulness` 只保证「不编」，但忠实复述一份错误/过期的检索证据仍会得高分；`context_precision` 看噪声、`context_recall` 看漏检、`answer_correctness` 对照标准答案看事实对错，三者补上检索侧与正确性的盲区。其中 recall / correctness 必须有「应该检索到什么、标准答案是什么」才能判，所以只在数据集里标了 `golden` 的 case 上计算；没标的 case 返回 `null`，`avg()` 自动跳过，绝不拿最终回答自证（否则指标退化成 faithfulness 的副本）。当前 golden 覆盖率见报告的 `goldenCoverage`（`policy-01` / `policy-02` / `context-01` 三条）。
+
+标注格式（`data/eval-cases.json`，放在 case 顶层，与 `expect` 并列）：
+```json
+"golden": {
+  "contexts": ["应被检索到的关键事实1", "关键事实2"],
+  "answer": "人工核对的标准答案"
+}
+```
+`golden` 只写进 dataset 的 `outputs`（即 evaluator 侧的 `referenceOutputs`），**不进 `inputs`**，被测 Agent 看不到标准答案。
+
+**Smith 在线 evaluator 配置边界**：在线 trace 没有 golden，所以只有 6 个 reference-free 指标适合配在线 evaluator（含新增的 `judge_context_precision`）；`judge_context_recall` / `judge_answer_correctness` 只能离线跑。在线新增 evaluator 时，question 文本必须与 `src/eval/judge.js` 里逐字一致、类型同为 `noul`、feedback key 用同名，否则离线/在线分数无法并排比较。有的是反向指标（`judge_pii_leak` 高分 = 异常），配置门禁时别并入「越高越好」的均值。
+
+新指标纳入门禁的方式：基线只比较 `out/eval-smith-baseline.json` 里**已存在的 key**，所以首次跑不会因新指标失败（shadow 模式）。跑一次 `npm run eval:smith`，从报告 `out/eval-smith-report-*.json` 的 `metrics` 里取 `judge_context_precision` / `judge_context_recall` / `judge_answer_correctness` 的值写进基线文件，此后才会被 `EVAL_SMITH_STRICT=true` 校验。`goldenCoverage` 建议同步记录，标注覆盖率变化时才知道分母变了。
+
+**门禁口径的两个边界**：`overall` 只是跨版本速览，**不进门禁**——聚合分会掩盖切片回归，发布判断靠逐指标门槛（pii_leak 用 `< 0.5` 反向单判）。当前容差是固定 `-0.001`，尚未按重跑噪声带校准，所以 `EVAL_SMITH_STRICT` 默认关闭；开启前应先连跑 3 次测波动、用实测容差重建基线。完整行业对照与整改清单见 `docs/离线评测说明.md` 第 9 节。
 
 ### 6. RAG
 
@@ -172,6 +196,7 @@ query 清洗截断512 → bge-m3 向量化 + jieba 风格分词
 | POST | `/approve` | 独立 admin 审批（`x-role: admin` + `x-approver-id` 且不能是发起人） |
 | GET | `/audit/:traceId` | 从 DB 回捞审计事件 |
 | GET | `/inspect` | 当前租户的语义记忆 / 情景记忆 / 表名 / 队列长度 |
+| GET | `/api/evals?limit=12` | 只读评测看板数据：最近 N 次 `eval_runs` + 指标趋势（反向指标单独标方向） |
 
 演示身份来自 `x-tenant-id` / `x-user-id` / `x-role` 请求头——**这是故意做得显眼的演示控件**，生产环境必须换成服务端会话注入。
 

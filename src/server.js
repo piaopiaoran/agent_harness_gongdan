@@ -4,7 +4,8 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import { config, PREFIX } from "./config.js";
 import { createRuntime, createSession, extractInterrupt } from "./runtime.js";
-import { listAudit, listFacts, searchEpisodes } from "./db/queries.js";
+import { listAudit, listEvalRuns, listFacts, searchEpisodes } from "./db/queries.js";
+import { buildEvalDashboard } from "./eval/dashboard.js";
 import { getPool } from "./db/pool.js";
 import { createEmbedder } from "./llm/embedding.js";
 import { flushTraces, logTracingStatus, tracingStatus } from "./observability/tracing.js";
@@ -161,6 +162,19 @@ export function buildApp(runtime) {
       });
     } catch (err) {
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  /** 只读评测看板数据：来自本地 eval_runs，不代理 LangSmith（在线反馈在 trace 上看）。 */
+  app.get("/api/evals", async (req, res) => {
+    try {
+      const rows = await listEvalRuns(req.query.limit);
+      res.json({ ...buildEvalDashboard(rows), generatedAt: new Date().toISOString() });
+    } catch (err) {
+      res.status(503).json({
+        error: "eval_store_unavailable",
+        message: String(err.message ?? "").slice(0, 200),
+      });
     }
   });
 

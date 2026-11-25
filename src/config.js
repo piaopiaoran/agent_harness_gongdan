@@ -18,8 +18,7 @@ const schema = z.object({
   LANGSMITH_API_KEY: z.string().optional().default(""),
   LANGSMITH_PROJECT: z.string().default("agent_harness_gongdan"),
   LANGSMITH_ENDPOINT: z.string().default("https://api.smith.langchain.com"),
-  // LLM Gateway：本地代码只用 LANGSMITH_API_KEY 认证，provider key 留在 workspace secret。
-  // TypeSafe SDK 自行拼接 /v1/systemone，这里填网关根地址，不能带 /v1。
+  // 旧版 LangSmith Gateway 配置保留兼容；judge 已改为直连 TypeSafe（与 Smith 在线 evaluator 同 key / 同模型）。
   LANGSMITH_GATEWAY_BASE_URL: z.string().default("https://gateway.smith.langchain.com"),
 
   LLM_PROVIDER: z.enum(["fake", "openai"]).default("fake"),
@@ -31,9 +30,11 @@ const schema = z.object({
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
   LLM_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
 
-  // 评测 judge：Jev（TypeSafe System One），离线与在线共用同一模型与同一套 question 名。
-  // 本地经 LangSmith Gateway 调用，只持有 LANGSMITH_API_KEY；TypeSafe key 存 workspace secret。
-  JUDGE_MODEL: z.string().default("typesafe/jev-1.13.0"),
+  // 评测 judge：Jev（TypeSafe System One），离线与在线共用同一模型、同一把 key、同一套 question 名。
+  // 直连 TypeSafe：key 放本机 .env（gitignored），Smith 在线 evaluator 用同名 workspace secret。
+  JUDGE_API_KEY: z.string().optional().default(""),
+  JUDGE_BASE_URL: z.string().default("https://api.typesafe.ai"),
+  JUDGE_MODEL: z.string().default("jev-latest"),
   JUDGE_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
 
   EMBEDDING_PROVIDER: z.enum(["siliconflow", "fake"]).default("fake"),
@@ -141,7 +142,7 @@ const env = parsed.data;
 
 // 密钥单独保存，不进入 config 对象：防止 console.log(config)、错误堆栈、
 // trace metadata 或任何「整体展开配置」的地方把 key 带出去。
-const { LLM_API_KEY, EMBEDDING_API_KEY, LANGSMITH_API_KEY, ...publicEnv } = env;
+const { LLM_API_KEY, EMBEDDING_API_KEY, LANGSMITH_API_KEY, JUDGE_API_KEY, ...publicEnv } = env;
 
 const useOpenAI = env.LLM_PROVIDER === "openai";
 if (useOpenAI && !LLM_API_KEY) {
@@ -152,9 +153,8 @@ const useRealEmbedding = env.EMBEDDING_PROVIDER === "siliconflow" && Boolean(EMB
 const embeddingEndpoint = useRealEmbedding
   ? assertSafeEndpoint(env.EMBEDDING_BASE_URL, "EMBEDDING_BASE_URL")
   : "local-fake";
-// judge 固定经 LangSmith Gateway 调 Jev。此处不强制要求 LANGSMITH_API_KEY，
-// 由 eval-smith.mjs 的网关预检给出可操作的报错，避免影响不跑评测的服务进程。
-const judgeGatewayEndpoint = assertGatewayEndpoint(env.LANGSMITH_GATEWAY_BASE_URL, "LANGSMITH_GATEWAY_BASE_URL");
+// judge 直连 TypeSafe：端点按普通 HTTPS 规则校验；缺 key 由 eval-smith.mjs 预检给可操作报错。
+const judgeBaseUrl = assertSafeEndpoint(env.JUDGE_BASE_URL, "JUDGE_BASE_URL");
 
 // LangChain / LangGraph 自动读取这些变量决定是否上报 trace。
 // 这里显式回写一遍，保证「先加载 config、后加载 LangChain」的顺序不依赖 import 顺序。
@@ -203,9 +203,9 @@ export const config = Object.freeze({
   judge: Object.freeze({
     model: env.JUDGE_MODEL,
     provider: "typesafe",
-    gatewayEndpoint: judgeGatewayEndpoint,
+    baseUrl: judgeBaseUrl,
     timeoutMs: env.JUDGE_TIMEOUT_MS,
-    label: `${env.JUDGE_MODEL} @ LangSmith Gateway (Jev)`,
+    label: `${env.JUDGE_MODEL} @ TypeSafe (Jev)`,
   }),
   tables: Object.freeze({
     workingMemory: `${PREFIX}_working_memory`,
@@ -225,6 +225,7 @@ export function getSecret(name) {
     case "llm": return LLM_API_KEY;
     case "embedding": return EMBEDDING_API_KEY;
     case "langsmith": return LANGSMITH_API_KEY;
+    case "judge": return JUDGE_API_KEY;
     default: throw new Error(`unknown secret: ${name}`);
   }
 }

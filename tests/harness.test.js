@@ -11,6 +11,13 @@ import { assembleContext } from "../src/context/assemble.js";
 import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 import { unansweredToolReplies, repairMessageSequence } from "../src/graph/nodes.js";
 import { resolveSessionId } from "../src/server.js";
+import {
+  ALL_QUESTION_KEYS,
+  GOLDEN_QUESTIONS,
+  REFERENCE_FREE_QUESTIONS,
+  buildJudgeInput,
+} from "../src/eval/judge.js";
+import { buildEvalDashboard } from "../src/eval/dashboard.js";
 
 test("分词保留词典专名与英文数字连续 token", () => {
   const tokens = segment("ORD-1001 左耳无声音，申请七天无理由退货");
@@ -137,6 +144,61 @@ test("空 sessionId 不会退化成共享 checkpoint 线程", () => {
   assert.equal(resolveSessionId("my-thread"), "my-thread");
 });
 
+test("Jev judge 键集合：reference-free 六个 + golden 两个，无重名", () => {
+  assert.equal(Object.keys(REFERENCE_FREE_QUESTIONS).length, 6);
+  assert.deepEqual(Object.keys(GOLDEN_QUESTIONS), ["judge_context_recall", "judge_answer_correctness"]);
+  assert.equal(new Set(ALL_QUESTION_KEYS).size, ALL_QUESTION_KEYS.length);
+  assert.ok(ALL_QUESTION_KEYS.includes("judge_context_precision"));
+});
+
+test("golden gating：无标注不注入参照、不问 recall/correctness；有标注才对齐", () => {
+  const base = {
+    inputs: { message: "我的手机号 13812345678，耳机保修期多久？" },
+    outputs: {
+      evidence: [{ id: "[证据1]", content: "保修 12 个月" }],
+      toolCalls: [], approvalRequired: false, verdict: "done", answer: "保修 12 个月",
+    },
+  };
+  const noGolden = buildJudgeInput(base);
+  assert.equal(noGolden.hasGolden, false);
+  assert.deepEqual(Object.keys(noGolden.questions), Object.keys(REFERENCE_FREE_QUESTIONS));
+  assert.doesNotMatch(noGolden.state, /应覆盖的关键信息|标准答案/);
+  assert.doesNotMatch(noGolden.state, /13812345678/);
+
+  const withGolden = buildJudgeInput({
+    ...base,
+    referenceOutputs: {
+      golden: {
+        contexts: ["全系列音频产品保修期为签收后 12 个月"],
+        answer: "保修 12 个月，联系 13812345678 核实",
+      },
+    },
+  });
+  assert.equal(withGolden.hasGolden, true);
+  assert.deepEqual(Object.keys(withGolden.questions), ALL_QUESTION_KEYS);
+  assert.match(withGolden.state, /应覆盖的关键信息/);
+  assert.match(withGolden.state, /评测参照/);
+  assert.doesNotMatch(withGolden.state, /13812345678/, "标准答案里的手机号也要脱敏");
+});
+
+test("golden gating：残缺标注（缺 answer 或空 contexts）视为无标注", () => {
+  const base = {
+    inputs: { message: "保修期？" },
+    outputs: { evidence: [], toolCalls: [], approvalRequired: false, verdict: "done", answer: "12 个月" },
+  };
+  const bad = [
+    { contexts: ["12 个月"] },
+    { answer: "12 个月" },
+    { contexts: [], answer: "12 个月" },
+    { contexts: ["12 个月"], answer: "" },
+  ];
+  for (const golden of bad) {
+    const r = buildJudgeInput({ ...base, referenceOutputs: { golden } });
+    assert.equal(r.hasGolden, false);
+    assert.deepEqual(Object.keys(r.questions), Object.keys(REFERENCE_FREE_QUESTIONS));
+  }
+});
+
 test("数据库对象命名：schema.sql 中所有对象以项目前缀开头", async () => {
   const sql = await readFile(new URL("../db/schema.sql", import.meta.url), "utf8");
   const created = [...sql.matchAll(/CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX|RULE|POLICY)\s+(?:IF NOT EXISTS\s+)?(?:"?([\w]+)"?)/gi)]
@@ -144,4 +206,90 @@ test("数据库对象命名：schema.sql 中所有对象以项目前缀开头", 
   assert.ok(created.length >= 15);
   const bad = created.filter((name) => !name.startsWith(`${PREFIX}_`));
   assert.deepEqual(bad, []);
+});
+
+test("评测看板：时间序列按时间正序，null 分数不画点也不算 delta", () => {
+  const rows = [
+    { id: "r2", run_name: "smith-b", dataset: "ds", passed: true, created_at: "2026-11-25T12:00:00Z",
+      metrics: { overall: 0.8, judge_context_precision: 0.7, judge_pii_leak: 0.1 }, baseline: { overall: 0.7 } },
+    { id: "r1", run_name: "smith-a", dataset: "ds", passed: false, created_at: "2026-11-25T11:00:00Z",
+      metrics: { overall: 0.6, judge_context_precision: null, judge_pii_leak: 0.2 }, baseline: {} },
+  ];
+  const d = buildEvalDashboard(rows);
+  assert.equal(d.latest.runName, "smith-b");
+  assert.equal(d.keys[0], "smith:overall");
+  const smith = d.groups.find((g) => g.id === "smith");
+  const overall = smith.series.find((s) => s.key === "overall");
+  assert.deepEqual(overall.points.map((p) => p.value), [0.6, 0.8]);
+  assert.equal(overall.delta, 0.2);
+  assert.equal(overall.improved, true);
+  assert.equal(overall.baseline, 0.7);
+  const precision = smith.series.find((s) => s.key === "judge_context_precision");
+  assert.deepEqual(precision.points.map((p) => p.value), [0.7]);
+  assert.equal(precision.delta, null);
+});
+
+test("评测看板：两条路径的 overall 分开分组，delta 与基线不跨轨计算", () => {
+  const rows = [
+    { id: "s2", run_name: "smith-judge-jev-latest", dataset: "ds-judge", passed: false,
+      created_at: "2026-11-26T00:38:00Z",
+      metrics: { overall: 0.7941, mechanism: 1, judge_faithfulness: 0.5733 },
+      baseline: { mechanism: 1, judge_faithfulness: 0.7 } },
+    { id: "s1", run_name: "smith-judge-deepseek-chat", dataset: "ds-judge", passed: true,
+      created_at: "2026-11-24T16:09:00Z",
+      metrics: { overall: 0.8889, mechanism: 1, judge_faithfulness: 0.7778 }, baseline: {} },
+    { id: "m2", run_name: "harness-eval-real", dataset: "data/eval-cases.json", passed: false,
+      created_at: "2026-11-24T15:57:00Z",
+      metrics: { overall: 0.7778, rag: 1, tool: 1, safety: 0.5, context: 1 },
+      baseline: { overall: 1, rag: 1, tool: 1, safety: 1, context: 1 } },
+    { id: "m1", run_name: "harness-eval-fake-mechanism", dataset: "data/eval-cases.json", passed: true,
+      created_at: "2026-11-24T15:56:00Z",
+      metrics: { overall: 1, rag: 1, tool: 1, safety: 1, context: 1 }, baseline: {} },
+  ];
+  const d = buildEvalDashboard(rows);
+  assert.deepEqual(d.groups.map((g) => g.id), ["smith", "mechanism"]);
+
+  const smith = d.groups[0];
+  const mech = d.groups[1];
+  assert.equal(smith.count, 2);
+  assert.equal(mech.count, 2);
+
+  const sOverall = smith.series.find((s) => s.key === "overall");
+  const mOverall = mech.series.find((s) => s.key === "overall");
+  assert.equal(sOverall.delta, -0.0948);
+  assert.equal(mOverall.delta, -0.2222);
+  assert.equal(sOverall.baseline, null);  // smith 基线里没有 overall
+  assert.equal(mOverall.baseline, 1);
+
+  assert.equal(smith.series.some((s) => s.key === "safety"), false);
+  assert.deepEqual(mech.series.map((s) => s.key), ["overall", "rag", "tool", "safety", "context"]);
+  assert.ok(d.keys.includes("smith:overall"));
+  assert.ok(d.keys.includes("mechanism:overall"));
+});
+
+test("评测看板：无法识别的历史行单独归组，不污染两条路径", () => {
+  const rows = [
+    { run_name: "mystery-run", metrics: { overall: 0.5 }, created_at: "2026-11-25T10:00:00Z" },
+  ];
+  const d = buildEvalDashboard(rows);
+  assert.deepEqual(d.groups.map((g) => g.id), ["other"]);
+  assert.equal(d.groups[0].series[0].key, "overall");
+});
+
+test("评测看板：反向指标 judge_pii_leak 下降才算改善", () => {
+  const rows = [
+    { run_name: "b", metrics: { judge_pii_leak: 0.3 }, created_at: "2026-11-25T12:00:00Z" },
+    { run_name: "a", metrics: { judge_pii_leak: 0.5 }, created_at: "2026-11-25T11:00:00Z" },
+  ];
+  const leak = buildEvalDashboard(rows).series[0];
+  assert.equal(leak.reverse, true);
+  assert.equal(leak.delta, -0.2);
+  assert.equal(leak.improved, true);
+});
+
+test("评测看板：空数据返回空 series 而不是抛错", () => {
+  const d = buildEvalDashboard([]);
+  assert.equal(d.count, 0);
+  assert.equal(d.latest, null);
+  assert.deepEqual(d.series, []);
 });

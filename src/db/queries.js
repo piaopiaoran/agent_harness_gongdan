@@ -246,3 +246,13 @@ export async function insertEvalRun({ runName, dataset, metrics, baseline, passe
     [runName, dataset, JSON.stringify(metrics), JSON.stringify(baseline), Boolean(passed)]
   ).then((r) => r.rows[0]);
 }
+
+/** 评测看板只读查询：eval_runs 无 tenant 列，查询不入 withTenant。 */
+export async function listEvalRuns(limit = 20) {
+  const n = Math.max(1, Math.min(100, Number(limit) || 20));
+  return getPool().query(
+    `SELECT id, run_name, dataset, metrics, baseline, passed, created_at
+       FROM ${T.evalRuns} ORDER BY created_at DESC, id DESC LIMIT $1`,
+    [n]
+  ).then((r) => r.rows);
+}
