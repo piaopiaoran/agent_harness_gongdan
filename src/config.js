@@ -186,8 +186,14 @@ export function assertSharedDatabase(raw) {
     throw new Error("[config] DATABASE_URL 不是合法连接串");
   }
   const local = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(u.hostname);
-  if (!local || (u.port && u.port !== "5432")) {
+  // 容器化部署：Compose 内网用服务名连接，显式置 DATABASE_ALLOW_REMOTE=true 才放行非本机主机；
+  // 默认仍要求指向本机共享库，避免应用层把连接串悄悄指到外部库。
+  const allowRemote = process.env.DATABASE_ALLOW_REMOTE === "true";
+  if (!allowRemote && !local) {
     throw new Error(`[config] DATABASE_URL 必须指向本机共享端口 5432，当前 ${u.host}`);
+  }
+  if (u.port && u.port !== "5432") {
+    throw new Error(`[config] DATABASE_URL 必须指向共享端口 5432，当前 ${u.host}`);
   }
   if (u.pathname !== "/postgres") {
     throw new Error(`[config] DATABASE_URL 必须连接共享的 postgres 库，当前 ${u.pathname}`);
