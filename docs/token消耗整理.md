@@ -13,9 +13,9 @@
 |---|---|---|---|
 | 本地估算 token | `estimateTokens(text)`：`Math.ceil(中文字符数 + 其他字符数 / 4)`（`src/rag/segment.js:67-73`） | 上下文分区预算、RAG 证据预算 | ❌ 粗估 |
 | 分词/切块词元 | `segment(text)`：词典最长匹配 + 未登录词 bigram + 英文数字连续串，最后 `Set` 去重（`src/rag/segment.js:13-53`） | RAG 切块阈值、DB `rag_chunks.tokens`、词法重合特征 | ❌ 是检索词元，不是 tokenizer |
-| 真实计费 token | LangChain `AIMessage.usage_metadata`（`input_tokens` / `output_tokens` / `total_tokens`） | 主模型调用后落审计；Jev judge 只记录 `input_tokens` | ✅ 供应商口径 |
+| 真实计费 token | LangChain `AIMessage.usage_metadata`（`input_tokens` / `output_tokens` / `total_tokens`） | 主模型调用后落审计并折算 cost；Jev judge 只记录 `input_tokens` | ✅ 供应商口径 |
 
-**关键判断**：预算系统用的是「本地估算」，不是模型真实 tokenizer；真实用量只在 `model_invoke` 审计事件里逐次记录，**没有会话级累加，也没有费用折算**。
+**关键判断**：预算系统用的是「本地估算」，不是模型真实 tokenizer；真实用量在 `model_invoke` 审计事件里逐次记录，按价格表折算成 USD 成本，并在 `/chat` / `/approve` 响应里按会话汇总。embedding 与 judge 的外部计费仍不在账内。
 
 ### 0.2 当前关键数字（以 `.env` 为准）
 
@@ -31,6 +31,7 @@
 | RAG 证据 | ≤6 块，单块截 1,600 字符，累计目标 ≤1,500 估算 token | `src/rag/retrieve.js:114-136` |
 | 输入 / 输出 / 工具输出 | 8,000 / 4,000 / 6,000 **字符** | `src/security/patterns.js:10`、`src/security/guard.js:31`、`src/graph/nodes.js:250` |
 | 单会话最大轮次 | 14（真正限制「历史反复入模」的刹车） | `src/security/rbac.js:35-38`，`.env:70` |
+| 价格表 | 内置参考价（USD / 1M token），`MODEL_PRICING_JSON` 可覆盖 | `src/observability/cost.js:12-19`，`src/config.js:26-33,216-219` |
 
 ### 0.3 Token 流向图
 
@@ -157,14 +158,33 @@ overflow = total + headroom > window
 
 1. `:65-71` 查询 `embedQuery`；失败 fail-close 拒答。
 2. `:73-76` 向量路 + 关键词路各 `RAG_RECALL_TOPK = 30`，并行执行。
-3. `:97-112` RRF(k=60) → `RAG_RERANK_TOPN = 20` → 启发式精排（相似度×2.2 + 词法×1.3 + 时效×0.3 − 0.55，sigmoid 后阈值 0.30）。本地启发式**不消耗 LLM token**；换真 cross-encoder 才会。
-4. `:114-138` 证据拼装：
+3. `:76-102` RRF(k=60) → `RAG_RERANK_TOPN = 20` → 精排已抽成 `src/rag/rerank.js`，三个 provider：
+   - **siliconflow（主路默认）**：一次 `POST /v1/rerank` 把 20 个候选批量送给 `BAAI/bge-reranker-v2-m3`（不是逐对 20 次），用 `results[].index` 映射回候选、按独立的 `RERANK_API_THRESHOLD=0.5` 过滤（`rerank.js:50-105`）。返回的 `meta.tokens` 只写进审计 trace，**不并入主 LLM 的 costLedger**——该模型当前在 SiliconFlow 免费，且它不是主对话模型。
+   - **heuristic（降级 / 离线兜底）**：`sigmoid(相似度×2.2 + 词法×1.3 + 时效×0.3 − 0.55)`，按 `RAG_RERANK_THRESHOLD=0.30` 过滤，**0 次模型调用**（`rerank.js:22-47`）。API 异常时自动回退到这里。
+   - **shadow**：`RERANK_SHADOW=true` 时双跑，仍用 heuristic 排序，BGE 的 top 分数 / id 只写进 `trace.stages[].shadow`，不切流量（当前已关闭）。
+   - 降级：API 异常 → heuristic → RRF 原始顺序，原 fail-open 语义不变。
+   - ⚠️ 两个阈值分布不同，**不能把 0.30 直接当 BGE 阈值**；当前 `RERANK_API_THRESHOLD=0.5` 是 shadow 数据给出的起步值，仍需用真实 query 集（含负例）持续回归标定。
+
+   **实测样本（2026-11-26，shadow 模式，3 个 query / 各 5 个候选）**：
+
+   | query | BGE top1 | BGE 中位数 | heuristic 保留 |
+   |---|---|---|---|
+   | 耳机保修期多久？（政策咨询） | 0.982 | 0.100 | 5 |
+   | 查订单 ORD-1001 的物流进度 | 0.029 | 0.001 | 5 |
+   | 公司年会什么时候办？（库里无答案） | 0.000 | 0.000 | 5 |
+
+   - heuristic 三种情况都保留 5 条，完全区分不了「有答案 / 没答案」；BGE 拉开了 0.982 与 0.000。
+   - 订单查询 BGE 全低分是**正确行为**：订单状态该走工具，不该拿政策文档凑证据。
+   - BGE 正例 top1=0.982、次高仅 0.240，中间有明显 gap；`RERANK_API_THRESHOLD` 取 **0.5**（已写入 `.env` / 代码默认），不是 0.30。样本量小（每 query 仅 5 个候选），不能据此定最终值，需持续回归。
+
+4. `:104-126` 证据拼装：
    - 单块 `sanitizeDocument(...).slice(0, RAG_EVIDENCE_CHUNK_TOKENS * 2)` = 1,600 字符；
    - `estimateTokens` 计算块 token；
    - `if (used + tokens > budgetTokens && evidence.length) break;`
    - ⚠️ `&& evidence.length` 意味着**第一块即使超预算也会被保留**，避免零证据。
    - 返回 `usedTokens`，并写入 trace 的 `evidence` 阶段。
 5. `nodes.js:106-108` 调用时显式传 `budgetTokens: config.CTX_RAG_TOKENS`（1500），与上下文分区 rag 预算同源。
+6. BGE 的 query+passage 有长度上限（服务实现常截到 512 token），而项目 chunk 本身是 512 token，所以送 API 前先按 `RERANK_MAX_CHARS=1600` 截短，并设 `max_chunks_per_doc=1` 禁止服务端再切块——切块会改变分数含义、增加用量。
 
 ### 3.4 记忆召回与远端摘要
 
@@ -230,7 +250,83 @@ curl -s -X POST http://localhost:3204/chat \
 
 **④ Judge 用量** —— Jev 调用把 `input_tokens=...` 拼进 LangSmith feedback 的 `comment`（`scripts/eval-smith.mjs:180-191`），去 LangSmith experiment 的 feedback 详情看；本地 `out/eval-smith-report-*.json` 只保存数值分数，**不含 comment / token 数**。
 
-**没有的东西**：按 session / tenant 的 token 汇总、费用（¥/$）折算、prompt cache 命中、embedding token 统计。
+**④b BGE 精排用量（新增）** —— `RERANK_PROVIDER=siliconflow` 时，`rag_retrieved` 审计事件的 `detail.trace.stages[]` 里 `stage=="rerank"` 会多出：
+
+- `provider` / `mode`（`shadow` 或 `live`）/ `model` / `latencyMs`；
+- `usage`：`meta.tokens.input_tokens` / `output_tokens`——该模型当前免费，**不计入主 LLM 的 `usage.costUsd`**；
+- `shadow`：`topScores` / `topIds`，即 BGE 视角的排序，供 shadow 阶段对比，线上排序仍走 heuristic。
+
+```bash
+curl -s -X POST http://localhost:3204/chat \
+  -H 'content-type: application/json' \
+  -d '{"message":"耳机保修期多久？"}' \
+  | jq '[.audit[] | select(.event=="rag_retrieved") | .detail.trace.stages[] | select(.stage=="rerank")]'
+```
+
+**⑤ 逐步查看工具（推荐入口）** —— `npm run usage`（`scripts/show-usage.mjs`）：
+
+```bash
+npm run usage -- --recent 5                       # 列出最近有模型调用的本地 trace
+npm run usage -- 396d49a8-c6d7-472d-93fe-c48ca26e6b14   # 本地审计：每次 LLM 调用的真实 usage + 成本
+npm run usage -- --smith 01a21635-7376-725d-a286-323f26cbe0e4  # Smith：逐个 run 的 token 树
+```
+
+⚠️ **两种 traceId 不同源**：本地审计用 `/chat` 响应里的 `identity.traceId`（UUID）；Smith URL 里的 `trace_id` 是 LangGraph 自动生成的 run trace id。脚本分别支持，不要混用。本地查的是 provider 真实 token，Smith 查的是上报到平台的 token，两边数字可对上。
+
+**⑥ 会话级 token / 成本汇总** —— `/chat` 与 `/approve` 响应新增 `usage`（`src/server.js:107,140`）：
+
+```bash
+curl -s -X POST http://localhost:3204/chat \
+  -H 'content-type: application/json' \
+  -H 'x-feature: refund-flow' \
+  -d '{"message":"查订单 ORD-1001"}' \
+  | jq '{calls: .usage.calls, tokens: .usage.tokens, costUsd: .usage.costUsd,
+         perCall: [.usage.invocations[] | {step: .steps, tokens: .tokens, costUsd, source}]}'
+```
+
+- `usage.invocations` 是逐次明细（threadId / tenantId / feature / model / usage / rates / costUsd / source），同一份数据也写在审计 `model_invoke.detail.cost`（`src/graph/nodes.js:162-167`）。
+- 计价只认 provider 返回的 `input_tokens` / `output_tokens`；缓存字段同时兼容 `input_token_details.cache_read`（LangChain/OpenAI 口径）与 `cached_read`，按 cached 单价；只有 `total_tokens` 的模型（fake）记 0，未知模型返回 `costUsd: null` 而不猜价。
+
+**⑥-b 精排用量（独立段，不并入主账）** —— `usage.rerank`（`src/server.js:34-79,106`）：
+
+```bash
+curl -s -X POST http://localhost:3204/chat \
+  -H 'content-type: application/json' \
+  -d '{"message":"耳机保修期多久？"}' \
+  | jq '.usage | {llm: {calls, tokens, costUsd}, rerank}'
+```
+
+- BGE rerank 的 `meta.tokens` 走独立管道：`rerank.js:89` 回调 → `retrieve.js:100` 写进 `rag_retrieved.detail.stages[].usage` → `extractRerankUsage()` 从审计提取 → `usage.rerank`。**不调用 `costLedger.add()`**，不污染主模型的 `calls / tokens / costUsd`。
+- 字段：`calls / provider / model / mode(live|shadow) / inputTokens / outputTokens / latencyMs / kept / threshold / degraded / priced:false / note`。
+- `priced: false` 是刻意设计：rerank 不是主对话模型、当前在 SiliconFlow 免费；将来换 Cohere 按 `search_units` 计费时，要在独立账本里折算，不能塞进 `costLedger`。
+- 前端「用量」tab 有独立的「精排 / Rerank」区块（`public/index.html:132`、`app.js:renderRerankUsage`），明确标注不与上方六个卡片相加；审计时间线点开 `rag_retrieved` 也能看原始 `trace.stages`。
+
+**⑦ LangSmith 会话聚合与归因** —— `src/observability/tracing.js:32-78`：
+
+- `metadata.thread_id = sessionId`，同时写 `gen_ai.conversation.id`（OTel GenAI 规范）→ 根 trace 可被 Threads / Turns 视图聚合；**只对新 trace 生效，历史不回填**。
+- 根 run tags：`feature:<feature>` / `tenant:<tenantId>`；child LLM run 额外带 `stage:agent` / `model:<model>`，不依赖父 run 继承。
+- `feature` 从请求头 `x-feature` 注入，默认 `ticket`，白名单 `[a-zA-Z0-9_-]{1,32}`（`src/server.js:29-31`）；`/health.pricing` 可查当前覆盖的价格模型。
+
+**⑧ 一条完整审计链的逐事件解读（第 41 轮示例）** —— 把三套口径放在同一条请求里看：
+
+| 事件 | 关键字段 | token 口径 | 是否计费 |
+|---|---|---|---|
+| `recallMemory · memory_recall` | `episodes: 5`、`facts: 5` | 无 token 字段，只报命中条数（embedding API 未回传 usage 给链路） | 外部 API，未入账 |
+| `retrieveRAG · rag_retrieved` | `query.tokens: 14`、`evidence.tokens: 1026`、`budget: 1500` | `estimateTokens` **估算**；query 是切词结果，evidence 是证据预算内的估算 | 不直接计费 |
+| `assembleContext · context_assembled` | `regions` = 203/39/4000/585/1026/374，`total: 6227`，`trimming: recent 11299→4000`，`headroomActual: 25773` | 全估算；`recent` 只做预算统计（`src/context/assemble.js:119`），不注入 systemText | 不计费 |
+| `agent · model_invoke` | `input_tokens: 16630`、`output_tokens: 252`、`total_tokens: 16882`、`cache_read: 0`、`reasoning: 13`、`costUsd: 0.0047673` | **provider 真实 usage**，唯一计费口径 | ✅ 入账 |
+| `guardOutput · output_guard` | `answerChars: 372` | 无 token | 无 |
+| `recordTurn · working_memory_appended` | `messages: 95`、`distillQueued: true` | 无 token；预示蒸馏 worker 还会调 LLM + embedding | 异步，未入本账 |
+
+三个关键读数：
+
+1. **`total: 6227` ≠ `input_tokens: 16630`，差 10,403。** systemText 实际只有 `203 + 39 + 1026 + 585 + 374 = 2227`；其余约 14,403 来自 `src/graph/nodes.js:150` 把 `[SystemMessage, ...healed.messages]` 全量历史直接入模。`recent` 从 11,299 压到 4,000 只改报告数字，**真实 94 条历史一条没少**。这是「工具循环让 input 越滚越大」的根因。
+2. **`1026` 出现两次不是两次消耗**：`retrieveRAG.evidence.tokens` 与 `contextReport.regions.rag` 是同一个估算值，后者直接引用前者。
+3. **`reasoning: 13` 是 output 252 的子集**：`16630 + 252 = 16882`，`unattributedTokens = 0`，reasoning 按 output 单价计费，不额外累加。成本核对：`(16630 × 0.27 + 252 × 1.10) / 1e6 = $0.0047673`。
+
+⚠️ **字段名的坑**：usage 里是 `input_token_details.cache_read`，旧实现只认 `cached_read`，导致即使命中缓存也会记 0、按全价计费；已改为两者都兼容（`src/observability/cost.js:68-71`）。本例值为 0，金额不受影响，但后续真实命中会算错价。
+
+**仍没有的东西**：embedding / judge 的外部 token 与费用、rerank 的费用折算（只有 token 与延迟，当前渠道免费）、按 session / tenant 的**持久化**汇总（`usage` 只在内存，进程重启清零）、换算成 ¥、蒸馏 worker 的独立 LLM 调用记账。
 
 ---
 
@@ -249,6 +345,12 @@ curl -s -X POST http://localhost:3204/chat \
 11. **外部计费不在账内**：embedding（SiliconFlow）、Jev judge（TypeSafe）的 token 都不进本地预算；judge 只把 `input_tokens` 写进评论。
 12. **文档与实现有落差**：README 描述的「跨区动态调度顺序」目前体现为各区独立软上限 + 定向裁剪，没有实现按优先级抢占的跨区重排。
 13. **配置默认值与实际值不同**：`src/config.js` 的 `LLM_MAX_TOKENS` 默认是 1024，但 `.env` / `.env.example` 写的是 3072；只改代码默认会让 reasoning 模型更容易截断。
+14. **价格是参考值**：`src/observability/cost.js` 的内置单价用于估算和实验，不是供应商账单；渠道别名 `deepseek-flash` 尤其要用 `MODEL_PRICING_JSON` 按实际套餐覆盖。未命中的模型返回 `costUsd: null`，不猜价。
+15. **thread_id 不回填历史 trace**：`metadata.thread_id` 只影响改动后新产生的 trace，Smith 里旧的孤立 run 不会自动归并。
+16. **账本是内存态**：`usage` 汇总随 session 存活，进程重启或 session 被 `MAX_SESSIONS` 淘汰后清零；需要长期按租户计费应落 `audit_events` 或专门账单表。
+17. **精排 API 的用量不进主账**：`RERANK_PROVIDER=siliconflow` 时 `meta.tokens` 只写审计 trace；BGE 当前免费，但换按次计费的 reranker（如 Cohere `search_units`）必须单独计价，不能混进 `costLedger`。
+18. **两个 rerank 阈值不能互换**：`RAG_RERANK_THRESHOLD=0.30` 属于 heuristic 的 sigmoid 分数；BGE 的 `relevance_score` 虽然同为 0~1，分布不同，主路用 `RERANK_API_THRESHOLD=0.5`（shadow 起步值），必须按真实 query 集持续标定。
+19. **shadow 不等于灰度**：`RERANK_SHADOW=true` 时仍会真实调用 BGE API（产生用量和延迟），但排序结果不生效；关掉 shadow 才会把 BGE 分数用于证据筛选。
 
 ---
 
@@ -256,16 +358,20 @@ curl -s -X POST http://localhost:3204/chat \
 
 | 文件 | token 相关行 | 职责 |
 |---|---|---|
-| `src/config.js` | 29, 47-63, 174-197 | 窗口 / Headroom / 分区预算 / 输出上限配置 |
+| `src/config.js` | 26-33, 58-67, 164, 181-183, 213-216, 263 | 价格表 / 窗口 / Headroom / 分区预算 / RERANK_* 配置与密钥回退 |
 | `src/rag/segment.js` | 13-53, 60-64, 67-73 | 分词词元、`lexicalOverlap`、`estimateTokens` |
 | `src/rag/ingest.js` | 12-35, 37-74 | 切块阈值、累积 overlap、DB token 落库 |
-| `src/rag/retrieve.js` | 58-63, 73-76, 103-112, 114-138 | 查询词元、召回、精排、证据 token 预算 |
+| `src/rag/rerank.js` | 22-47, 50-105, 109-138 | heuristic / BGE cross-encoder / shadow 双跑 / 降级与 usage 回调 |
+| `src/rag/retrieve.js` | 40-41, 76-102, 104-126 | 查询词元、召回、精排接入与 trace、证据 token 预算 |
 | `src/context/assemble.js` | 21-31, 44-65, 67-110, 112-126 | 六区预算、裁剪记录、溢出判定 |
 | `src/memory/recall.js` | 9-15, 44-54 | 查询 embedding、远端摘要字符上限 |
 | `src/memory/distiller.js` | 18-30, 50-108 | 蒸馏 2048 maxTokens、输入 6000 字符、embedding 次数 |
 | `src/memory/working.js` | 3-21 | 原始流水只落库，不直接注入 prompt |
-| `src/llm/model.js` | 25-85, 92-103, 107-119 | fake/real 模型、`maxTokens`、超时、fake usage |
-| `src/graph/nodes.js` | 104-117, 120-139, 142-174, 226-265, 306-324 | 证据预算传入、上下文报告、真实 usage 审计、工具输出截断、蒸馏入队 |
+| `src/llm/model.js` | 25-85, 92-103, 107-121 | fake/real 模型、`maxTokens`、超时、fake usage、调用级 config |
+| `src/observability/cost.js` | 10-19, 41-60, 63-104, 106-137 | 价格表 / 前缀匹配 / usage 计价 / 会话账本 |
+| `src/observability/tracing.js` | 32-78 | `thread_id` / OTel 会话字段 / 根 run 与 LLM run 归因标签 |
+| `src/graph/nodes.js` | 104-117, 120-139, 142-170, 226-265, 306-324 | 证据预算、上下文报告、真实 usage + cost 审计、工具输出截断、蒸馏入队 |
+| `src/runtime.js` | 44-66 | feature / identity / 成本账本 / LangGraph thread_id |
 | `src/graph/state.js` | 19-20 | `rag.usedTokens` / `contextReport` 进 checkpoint |
 | `src/security/patterns.js` | 4-11 | 输入字符截断 |
 | `src/security/guard.js` | 31, 47-69 | 输出字符截断、审计事件落地 |
@@ -273,15 +379,17 @@ curl -s -X POST http://localhost:3204/chat \
 | `src/eval/judge.js` | 85-105 | judge state 拼装 |
 | `scripts/eval-smith.mjs` | 163-180 | Jev 调用与 `input_tokens` 记录 |
 | `scripts/check-smith.mjs` | 30-34 | LangSmith 项目级 `total_tokens` |
+| `scripts/show-usage.mjs` | 全文 | 按 traceId 打印本地逐次 usage + 成本，或 Smith 逐个 run 的 token 树 |
 | `scripts/eval.mjs` | 10-14 | 默认 fake provider，零 LLM 成本 |
-| `src/server.js` | 42-59, 79-95, 135-141 | `/health` 预算、`/chat` 报告、审计回捞 |
+| `src/server.js` | 29-31, 34-79, 51-62, 76-110, 140 | feature 白名单、`extractRerankUsage` 独立段、`/health` 预算与价格、`/chat` 报告与 usage、审计回捞 |
+| `public/index.html` / `public/app.js` | 127-136 / 401-441 | 用量 tab 主账 + 精排独立区块渲染 |
 | `public/app.js` | 373-397, 580 | 前端 token 条形图、Headroom 说明 |
 | `public/rag-docs.js` | 58 | chunk token 展示 |
 | `db/schema.sql` | 109-122, 134- | `rag_chunks.tokens`、`audit_events.detail` |
-| `.env` / `.env.example` | 21, 33, 42-58 / 19, 22, 33, 47-64 | 实际生效参数 |
+| `.env` / `.env.example` | 21, 33, 37-58 / 19, 22, 33, 45-75 | 实际生效参数；RERANK_* 已切主路：`.env` 设 `siliconflow` + 阈值 0.5（召回仍 bge-m3），heuristic 仅降级兜底 |
 
 ---
 
 ## 7. 面试 60 秒口径（可直接背）
 
-> 这个项目的 token 治理分三层：**估算层**用 `estimateTokens`（中文 1 字 1 token、英文 4 字符 1 token）管 32K 窗口下的六个软上限，Headroom 固定留 35%，优先保系统指令和结构化状态，记忆按相似度丢、证据按预算丢、远端摘要做有损压缩；**限制层**用字符上限和 14 轮 tool 预算兜住输入、工具返回和历史重发；**计量层**只在每次 `model_invoke` 的审计事件里记 `usage_metadata`，LangSmith 看项目累计，judge 用量写进评测 comment。已知取舍是估算不等于真实 tokenizer、recent 截断只影响报告、没有会话级费用汇总，所以真要控成本，下一步是接真实 tokenizer + 跨轮 token 累加 + 按租户计费。
+> 这个项目的 token 治理分三层：**估算层**用 `estimateTokens`（中文 1 字 1 token、英文 4 字符 1 token）管 32K 窗口下的六个软上限，Headroom 固定留 35%，优先保系统指令和结构化状态，记忆按相似度丢、证据按预算丢、远端摘要做有损压缩；**限制层**用字符上限和 14 轮 tool 预算兜住输入、工具返回和历史重发；**计量层**在每次 `model_invoke` 记 provider `usage_metadata`，按可覆盖的参考价格表折算 USD，在响应里按会话汇总；trace metadata 补了 `thread_id` / `gen_ai.conversation.id` 与 feature、tenant 标签，Smith 可看 Turns 并按标签筛选。精排主路已切到 SiliconFlow 的 `BAAI/bge-reranker-v2-m3`（召回仍是 bge-m3），一次批量请求给 top20 打分、按独立阈值 0.5 过滤；本地 sigmoid 降级兜底，shadow 双跑只记分数不切流量（已关闭），用量只进审计不进主账本。已知取舍是估算不等于真实 tokenizer、recent 截断只影响报告、价格不是实时账单、账本只在内存、embedding / judge / rerank 费用不在账内，所以真要控成本，下一步是接真实 tokenizer + 价格表对接账单 API + 账单持久化 + 外部调用独立计价。

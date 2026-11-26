@@ -10,6 +10,7 @@ import { buildDocumentCatalog } from "./rag/catalog.js";
 import { getPool } from "./db/pool.js";
 import { createEmbedder } from "./llm/embedding.js";
 import { flushTraces, logTracingStatus, tracingStatus } from "./observability/tracing.js";
+import { PRICING_NOTE } from "./observability/cost.js";
 import { TOOL_META } from "./tools.js";
 
 const publicDir = join(dirname(fileURLToPath(import.meta.url)), "..", "public");
@@ -24,9 +25,71 @@ export function resolveSessionId(input) {
   return value && value.length <= 128 ? value : randomUUID();
 }
 
+/** 功能场景归因：只收低基数白名单字符，防止污染 Smith tag / metadata。 */
+export function resolveFeature(input) {
+  const value = String(input ?? "").trim();
+  return /^[a-zA-Z0-9_-]{1,32}$/.test(value) ? value : "ticket";
+}
+
+/**
+ * 从审计事件里提取精排用量，作为独立段暴露，不并入主 LLM 的 costLedger。
+ * 来源：rag_retrieved.detail.stages 中 stage === "rerank" 的项。
+ * 只读取已上报的 token / 延迟，不猜价、不把 rerank 计进主模型账本。
+ */
+export function extractRerankUsage(auditEvents = []) {
+  const stages = [];
+  const degradations = [];
+  for (const event of auditEvents ?? []) {
+    if (event?.event !== "rag_retrieved") continue;
+    const detail = event.detail ?? {};
+    for (const stage of detail.stages ?? []) {
+      if (stage?.stage === "rerank") stages.push(stage);
+    }
+    for (const d of detail.degradations ?? []) degradations.push(d);
+  }
+  if (!stages.length) {
+    const managed = (config.RERANK_PROVIDER ?? "") === "siliconflow";
+    return {
+      calls: 0, provider: config.RERANK_PROVIDER ?? "heuristic",
+      model: config.RERANK_MODEL ?? null, mode: config.rerankMode ?? null,
+      inputTokens: 0, outputTokens: 0, latencyMs: 0,
+      kept: 0, threshold: null, degraded: degradations.length > 0,
+      priced: false,
+      note: managed
+        ? "本次未触发外部精排；无 BGE token 消耗"
+        : "本次未触发精排；当前 provider 走本地打分，无外部 token",
+    };
+  }
+  const last = stages[stages.length - 1];
+  const inputTokens = stages.reduce((n, s) => n + Number(s.usage?.input_tokens ?? s.usage?.inputTokens ?? 0), 0);
+  const outputTokens = stages.reduce((n, s) => n + Number(s.usage?.output_tokens ?? s.usage?.outputTokens ?? 0), 0);
+  const latencyMs = stages.reduce((n, s) => n + Number(s.latencyMs ?? 0), 0);
+  const degraded = degradations.some((d) => d?.stage === "rerank");
+  const managed = last.provider === "siliconflow";
+  return {
+    calls: stages.length,
+    provider: last.provider ?? config.RERANK_PROVIDER,
+    model: config.RERANK_MODEL ?? null,
+    mode: last.mode ?? null,
+    inputTokens, outputTokens, latencyMs,
+    kept: Number(last.kept ?? 0),
+    threshold: last.threshold ?? null,
+    degraded,
+    priced: false,
+    note: managed
+      ? "精排为独立外部服务，token 不计入主模型账本；该模型当前在 SiliconFlow 免费，配置价格表后可按实际账单折算"
+      : "本地启发式精排，0 次外部调用、0 token",
+  };
+}
+
 export function buildApp(runtime) {
   const app = express();
   const sessions = new Map();
+  /** 主 LLM 账本 + 独立精排段；两者不合并，避免污染 token / 成本口径。 */
+  const usageOf = (sess) => ({
+    ...sess.costLedger.summary(),
+    rerank: extractRerankUsage(sess.auditor.events),
+  });
 
   app.use((_req, res, next) => {
     res.setHeader("Content-Security-Policy",
@@ -48,6 +111,11 @@ export function buildApp(runtime) {
       embeddingMode: config.embeddingMode,
       tracing: tracingStatus(),
       budgets: config.budget,
+      pricing: {
+        currency: config.pricing.currency,
+        overrideModels: Object.keys(config.pricing.overrides),
+        note: PRICING_NOTE,
+      },
       rag: {
         recallTopK: config.RAG_RECALL_TOPK, rrfK: config.RAG_RRF_K,
         rerankTopN: config.RAG_RERANK_TOPN, threshold: config.RAG_RERANK_THRESHOLD,
@@ -64,12 +132,13 @@ export function buildApp(runtime) {
     const tenantId = String(req.get("x-tenant-id") ?? "tenant-a");
     const userId = String(req.get("x-user-id") ?? "u-1");
     const role = req.get("x-role") === "admin" ? "admin" : "user";
+    const feature = resolveFeature(req.get("x-feature"));
 
     const rl = await runtime.rateLimiter.check(`${tenantId}:${userId}`);
     if (!rl.ok) return res.status(429).json({ error: "rate_limited", retryAfterMs: rl.retryAfterMs });
 
     const sessionId = resolveSessionId(req.body?.sessionId);
-    const sess = createSession(runtime, { tenantId, userId, role, sessionId, rateResult: rl });
+    const sess = createSession(runtime, { tenantId, userId, role, feature, sessionId, rateResult: rl });
     sessions.set(sess.sessionId, sess);
     if (sessions.size > MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
 
@@ -91,6 +160,7 @@ export function buildApp(runtime) {
         toolPlan: result.toolPlan ?? [],
         toolResults: result.toolResults ?? [],
         audit: sess.auditor.events,
+        usage: usageOf(sess),
         distillQueued: Boolean(result.distillQueued),
       });
     } catch (err) {
@@ -123,6 +193,7 @@ export function buildApp(runtime) {
         approval: result.approval ?? null,
         toolResults: result.toolResults ?? [],
         audit: sess.auditor.events,
+        usage: usageOf(sess),
         contextReport: result.contextReport ?? null,
         rag: result.rag ?? null,
       });

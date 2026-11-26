@@ -9,6 +9,7 @@ import { recallMemories } from "../memory/recall.js";
 import { retrieveEvidence } from "../rag/retrieve.js";
 import { assembleContext } from "../context/assemble.js";
 import { recordTurn as recordWorkingTurn } from "../memory/working.js";
+import { llmCallConfig } from "../observability/tracing.js";
 
 /**
  * 协议完整性：OpenAI 兼容端点要求每个 assistant.tool_calls 都有对应 tool_call_id 的
@@ -66,7 +67,7 @@ export function unansweredToolReplies(messages, reason = "该工具调用未被�
 }
 
 export function createNodes(deps) {
-  const { auditor, identity, embedder, model, registry, queue, rateResult } = deps;
+  const { auditor, identity, embedder, model, registry, queue, rateResult, costLedger } = deps;
   const emit = (...args) => auditor.emit(...args);
 
   return {
@@ -149,7 +150,8 @@ export function createNodes(deps) {
       const messages = [new SystemMessage(state.systemText || SYSTEM_PROMPT), ...healed.messages];
       let reply;
       try {
-        reply = await invokeModel(deps.model, messages);
+        // 每次 LLM 调用单独打归因标签；child run 不依赖父 run 的 metadata 继承。
+        reply = await invokeModel(deps.model, messages, llmCallConfig(identity, { stage: "agent" }));
       } catch (err) {
         await emit("agent", "model_error", "deny", ["model_error"], { reason: err.message });
         return { messages: [], verdict: "model_error", refusalReason: err.message };
@@ -157,8 +159,12 @@ export function createNodes(deps) {
       const text = extractText(reply);
       const calls = reply.tool_calls ?? [];
       const steps = state.steps + 1;
+      const cost = costLedger.add(reply.usage_metadata, {
+        threadId: identity.sessionId, tenantId: identity.tenantId,
+        feature: identity.feature, steps,
+      });
       await emit("agent", "model_invoke", "allow", [],
-        { tools: calls.map((c) => c.name), textChars: text.length, steps, usage: reply.usage_metadata ?? null });
+        { tools: calls.map((c) => c.name), textChars: text.length, steps, usage: reply.usage_metadata ?? null, cost });
 
       if (!calls.length) {
         return { messages: [reply, ...healed.repairs], finalAnswer: text, steps, verdict: "answer" };

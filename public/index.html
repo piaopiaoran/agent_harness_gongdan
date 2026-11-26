@@ -80,6 +80,7 @@
         <button class="tab" data-tab="rag">RAG</button>
         <button class="tab" data-tab="memory">记忆</button>
         <button class="tab" data-tab="context">上下文</button>
+        <button class="tab" data-tab="usage">用量</button>
         <button class="tab" data-tab="security">安全</button>
         <button class="tab" data-tab="eval">评测</button>
         <button class="tab" data-tab="learn">讲解</button>
@@ -120,7 +121,17 @@
         <div class="budget" id="budget"></div>
         <h3>裁剪记录</h3>
         <div class="trimming" id="trimming"></div>
-        <p class="hint-block">填充优先级：系统指令 → Agent State → 近程轨迹 → 检索记忆 → 远端摘要；Headroom 强制预留 35%。</p>
+        <p class="hint-block">填充优先级：系统指令 → Agent State → 近程轨迹 → 检索记忆 → 远端摘要；Headroom 强制预留 35%。这里是<b>估算 token</b>（中文 1 字≈1 token），只用于分配预算，不等于计费 token；真实用量看「用量」标签。</p>
+      </div>
+
+      <div class="tab-panel" id="tab-usage" hidden>
+        <h3>真实用量 <span class="hint">provider usage · 每次 LLM 调用一行</span></h3>
+        <div class="usage-summary" id="usageSummary"><p class="empty">尚未调用模型</p></div>
+        <div class="usage" id="usage"><p class="empty">尚未调用模型</p></div>
+        <h3>精排 / Rerank <span class="hint">独立外部服务 · 不并入上方主模型账本</span></h3>
+        <div class="usage" id="rerankUsage"><p class="empty">尚未触发精排</p></div>
+        <h3>口径说明</h3>
+        <p class="hint-block">上方记的是主模型返回的 <code>usage_metadata</code>，是真实计费 token；「上下文」标签里的是本地估算，两者不可混用。精排（Rerank）是独立外部服务，token 只进审计、不计入主模型账本，也不与上方数字相加。RAG / 记忆 / 工具节点本身不消耗模型 token，它们让下一轮 input 变大，可从相邻两次调用的 input 增量间接看出。成本按参考价折算，生产请用 <code>MODEL_PRICING_JSON</code> 按实际账单覆盖。</p>
       </div>
 
       <div class="tab-panel" id="tab-security" hidden>

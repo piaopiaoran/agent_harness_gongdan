@@ -19,6 +19,7 @@
     "test": "LANGSMITH_TRACING=false node --test tests/*.test.js",
     "check:llm": "node scripts/check-llm.mjs",
     "check:smith": "node scripts/check-smith.mjs",
+    "usage": "node scripts/show-usage.mjs",
     "check:eval": "node scripts/check-eval-health.mjs",
     "eval:smith": "node scripts/eval-smith.mjs"
   },

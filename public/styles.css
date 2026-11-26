@@ -299,6 +299,23 @@ body {
 .fill.headroom { background: #d0d5dd; }
 .trimming-item { font-size: 11px; color: var(--amber); margin-bottom: 4px; }
 
+.usage-summary { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.usage-chip {
+  flex: 1 1 88px; border: 1px solid var(--line); border-radius: 8px;
+  background: #f8f9fc; padding: 6px 8px; display: flex; flex-direction: column; gap: 2px;
+}
+.usage-chip-label { font-size: 10px; color: var(--muted); }
+.usage-chip b { font-size: 12px; color: var(--text); }
+.usage-item { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 7px; }
+.usage-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.usage-head b { font-size: 12px; color: var(--accent); }
+.usage-tag { font-size: 10px; color: var(--green); background: var(--green-soft); border-radius: 4px; padding: 1px 6px; }
+.usage-line { font-size: 11px; color: var(--text); margin-top: 5px; }
+.usage-line.muted { color: var(--muted); }
+.rerank-item { border-color: #b9c7f5; background: var(--accent-soft); }
+.usage-tag-warn { color: var(--amber); background: var(--amber-soft); }
+.usage-footnote { font-size: 10px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+
 .learn h4 { margin: 14px 0 5px; font-size: 12px; color: var(--accent); }
 .learn p, .learn li { font-size: 12px; color: #475467; }
 .learn ul { padding-left: 18px; margin: 4px 0; }

@@ -2,10 +2,10 @@ import { config } from "../config.js";
 import { vectorSearchChunks, keywordSearchChunks, getDocumentTitles } from "../db/queries.js";
 import { segment, lexicalOverlap, estimateTokens } from "./segment.js";
 import { normalizeInput, sanitizeDocument } from "../security/patterns.js";
+import { rerankCandidates, rerankHeuristic } from "./rerank.js";
 
-function sigmoid(x) {
-  return 1 / (1 + Math.exp(-x));
-}
+// 兼容原有测试/调用方：原来的同步 rerank() 现在是 heuristic provider。
+export { rerankHeuristic as rerank };
 
 /** RRF：只吃排名不吃分数，k=60 是标准基线。 */
 export function rrfFuse(lists, k = config.RAG_RRF_K) {
@@ -20,33 +20,6 @@ export function rrfFuse(lists, k = config.RAG_RRF_K) {
     });
   }
   return [...scores.values()].sort((a, b) => b.score - a.score);
-}
-
-/**
- * Cross-Encoder 的本地基线替身：sigmoid(相似度 + 词法重合 + 时效) 后按 0.30 阈值过滤。
- * 接口与真 cross-encoder 一致（逐对打分 → 阈值 → 去重），换成真模型只改本函数。
- */
-export function rerank(candidates, queryTokens, embedder, queryEmbedding) {
-  try {
-    const scored = candidates.map((c) => {
-      const similarity = Number(c.row.similarity ?? 0);
-      const lexical = lexicalOverlap(queryTokens, c.row.content);
-      const ageDays = (Date.now() - new Date(c.row.created_at ?? Date.now()).getTime()) / 86400000;
-      const recency = Math.max(0, 1 - ageDays / 365);
-      const raw = similarity * 2.2 + lexical * 1.3 + recency * 0.3 - 0.55;
-      return { ...c, rerankScore: sigmoid(raw), similarity, lexical };
-    });
-    const kept = scored.filter((c) => c.rerankScore >= config.RAG_RERANK_THRESHOLD);
-    const seen = new Set();
-    return kept.filter((c) => {
-      const key = c.row.content_hash ?? c.row.content;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    }).sort((a, b) => b.rerankScore - a.rerankScore);
-  } catch (err) {
-    return { error: err.message, fallback: candidates };
-  }
 }
 
 /**
@@ -101,14 +74,32 @@ export async function retrieveEvidence(embedder, rawQuery, { tenantId, budgetTok
   trace.stages.push({ stage: "rrf", k: config.RAG_RRF_K, candidates: fused.length });
 
   const topN = fused.slice(0, config.RAG_RERANK_TOPN);
-  const rankedResult = rerank(topN, queryTokens, embedder, queryEmbedding);
-  let ranked;
-  if (rankedResult.error) {
+  const rr = await rerankCandidates({
+    candidates: topN, query: clean, queryTokens, embedder, queryEmbedding,
+  });
+  let ranked = rr.ranked;
+  if (rr.error) {
+    // BGE API 异常 → 已自动回退 heuristic；这里只记录降级，不打断链路。
+    trace.degradations.push({ stage: "rerank", policy: "fail-open", from: "siliconflow", reason: rr.error });
+  }
+  if (ranked?.error) {
+    // heuristic 自身也异常 → 退回 RRF 原始顺序（原有 fail-open 语义）。
     ranked = topN;
-    trace.degradations.push({ stage: "rerank", policy: "fail-open", reason: rankedResult.error });
+    trace.degradations.push({ stage: "rerank", policy: "fail-open", reason: ranked.error });
   } else {
-    ranked = rankedResult;
-    trace.stages.push({ stage: "rerank", kept: ranked.length, threshold: config.RAG_RERANK_THRESHOLD });
+    const stage = {
+      stage: "rerank",
+      provider: rr.provider,
+      mode: rr.shadow ? "shadow" : "live",
+      kept: ranked.length,
+      threshold: rr.provider === "siliconflow"
+        ? config.RERANK_API_THRESHOLD
+        : config.RAG_RERANK_THRESHOLD,
+      latencyMs: rr.latencyMs,
+    };
+    if (rr.usage) stage.usage = rr.usage;
+    if (rr.shadow) stage.shadow = rr.shadow;
+    trace.stages.push(stage);
   }
 
   // 证据拼装：最多 6 块，单块 800 token，总量不超检索记忆预算；带来源编号。

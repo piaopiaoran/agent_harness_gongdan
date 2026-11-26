@@ -12,6 +12,7 @@ import { createAuditor } from "./security/guard.js";
 import { buildGraph } from "./graph/buildGraph.js";
 import { distillOnce } from "./memory/distiller.js";
 import { traceConfig } from "./observability/tracing.js";
+import { createCostLedger } from "./observability/cost.js";
 
 /** 全局共享资源：连接池、模型、checkpointer、限流器、优先级队列与 worker。 */
 export async function createRuntime({ startWorker = true, forceMemoryCheckpointer = false } = {}) {
@@ -41,15 +42,17 @@ export async function createRuntime({ startWorker = true, forceMemoryCheckpointe
 }
 
 /** 每次请求创建独立 session：身份、审计、工具注册表、模型绑定都不跨请求复用。 */
-export function createSession(runtime, { tenantId = "tenant-a", userId = "u-1", role = "user", sessionId = randomUUID(), rateResult = null } = {}) {
+export function createSession(runtime, { tenantId = "tenant-a", userId = "u-1", role = "user", feature = "ticket", sessionId = randomUUID(), rateResult = null } = {}) {
   const identity = {
-    traceId: randomUUID(), sessionId, tenantId, userId, role,
+    traceId: randomUUID(), sessionId, tenantId, userId, role, feature,
   };
   const auditor = createAuditor(identity);
   const tools = createTools({ identity, traceId: identity.traceId });
   const model = createModel({ tools: tools.langchainTools });
+  // 每次请求的账本：调用级真实 usage → 成本，随会话存活，不跨进程持久化。
+  const costLedger = createCostLedger();
   const graph = buildGraph({
-    ...runtime, auditor, identity, model, registry: tools.registry,
+    ...runtime, auditor, identity, model, registry: tools.registry, costLedger,
     rateResult: rateResult ?? { backend: runtime.rateLimiter.backend(), remaining: null },
   });
   const runConfig = {
@@ -59,7 +62,7 @@ export function createSession(runtime, { tenantId = "tenant-a", userId = "u-1", 
   };
 
   return {
-    identity, auditor, graph, runConfig, sessionId,
+    identity, auditor, graph, runConfig, sessionId, costLedger,
     start(raw) {
       return graph.invoke({ input: { raw: String(raw ?? "") }, identity }, runConfig);
     },

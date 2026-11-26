@@ -104,11 +104,11 @@ export function createModel({ tools = [] } = {}) {
 }
 
 /** 带硬超时的调用：Worker 直连模型，本地超时 / 重试 / 熔断是最后一环。 */
-export async function invokeModel(model, messages) {
+export async function invokeModel(model, messages, callConfig = {}) {
   let timer;
   try {
     return await Promise.race([
-      model.invoke(messages),
+      model.invoke(messages, callConfig),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error(`model_timeout_${config.LLM_TIMEOUT_MS}ms`)), config.LLM_TIMEOUT_MS + 2000);
       }),

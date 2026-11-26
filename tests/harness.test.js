@@ -4,13 +4,14 @@ import { readFile } from "node:fs/promises";
 import { PREFIX, config } from "../src/config.js";
 import { segment, estimateTokens } from "../src/rag/segment.js";
 import { rrfFuse, rerank } from "../src/rag/retrieve.js";
+import { rerankViaSiliconFlow, rerankCandidates } from "../src/rag/rerank.js";
 import { maskPII, maskToolArgs } from "../src/security/pii.js";
 import { guardInput, guardOutput } from "../src/security/guard.js";
 import { authorizeTool } from "../src/security/rbac.js";
 import { assembleContext } from "../src/context/assemble.js";
 import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 import { unansweredToolReplies, repairMessageSequence } from "../src/graph/nodes.js";
-import { resolveSessionId } from "../src/server.js";
+import { resolveSessionId, extractRerankUsage } from "../src/server.js";
 import {
   ALL_QUESTION_KEYS,
   GOLDEN_QUESTIONS,
@@ -321,4 +322,146 @@ test("知识库目录：空数据返回空列表，同 source 多版本按版本
     { id: "new", source: "a.md", title: "A", version: 2 },
   ], []);
   assert.deepEqual(cat.documents.map((d) => d.id), ["new", "old"]);
+});
+
+const mkCandidate = (id, content, hash, similarity = 0.9) => ({
+  row: { id, content, content_hash: hash, similarity, created_at: new Date().toISOString() },
+});
+
+test("BGE rerank：按 index 映射回候选，阈值过滤 + 去重 + usage 上报", async () => {
+  const c = [mkCandidate("c1", "退款政策", "h1"), mkCandidate("c2", "退款政策", "h1"), mkCandidate("c3", "保修12个月", "h2")];
+  let body;
+  const fakeFetch = async (url, init) => {
+    assert.match(url, /\/rerank$/);
+    body = JSON.parse(init.body);
+    return {
+      ok: true,
+      json: async () => ({
+        id: "r1",
+        results: [
+          { index: 1, relevance_score: 0.91 },
+          { index: 0, relevance_score: 0.88 },
+          { index: 2, relevance_score: 0.12 },
+        ],
+        meta: { tokens: { input_tokens: 120, output_tokens: 3 } },
+      }),
+    };
+  };
+  let usage;
+  const out = await rerankViaSiliconFlow(c, "退款政策", {
+    threshold: 0.3,
+    endpoint: "https://api.siliconflow.cn/v1",
+    apiKey: "test",
+    fetchImpl: fakeFetch,
+    onUsage: (u) => { usage = u; },
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].row.id, "c2");
+  assert.equal(out[0].rerankScore, 0.91);
+  assert.equal(out[0].rerankSource, "cross-encoder");
+  assert.deepEqual(usage, { input_tokens: 120, output_tokens: 3 });
+  assert.equal(body.model, "BAAI/bge-reranker-v2-m3");
+  assert.equal(body.return_documents, false);
+  assert.equal(body.max_chunks_per_doc, 1);
+  assert.equal(body.documents.length, 3);
+});
+
+test("BGE rerank：HTTP 失败抛错，统一入口降级回 heuristic", async () => {
+  const c = [mkCandidate("c1", "退款政策", "h1")];
+  const fakeFetch = async () => ({ ok: false, status: 500, text: async () => "boom" });
+  await assert.rejects(
+    () => rerankViaSiliconFlow(c, "退款", { fetchImpl: fakeFetch }),
+    /HTTP 500/
+  );
+  const out = await rerankCandidates({
+    candidates: c, query: "退款", queryTokens: ["退款"],
+    options: { provider: "siliconflow", fetchImpl: fakeFetch },
+  });
+  assert.equal(out.provider, "heuristic");
+  assert.match(out.error, /HTTP 500/);
+  assert.equal(out.ranked.length, 1);
+});
+
+test("BGE rerank：响应格式异常抛错而不是静默返回空", async () => {
+  const fakeFetch = async () => ({ ok: true, json: async () => ({ error: "bad" }) });
+  await assert.rejects(
+    () => rerankViaSiliconFlow([mkCandidate("c1", "x", "h1")], "q", { fetchImpl: fakeFetch }),
+    /缺少 results/
+  );
+});
+
+test("默认 heuristic 不发 API；shadow 双跑只记录分数、排序仍用基线", async () => {
+  let called = 0;
+  const plain = await rerankCandidates({
+    candidates: [mkCandidate("c1", "退款政策", "h1")], query: "退款", queryTokens: ["退款"],
+    options: { provider: "heuristic", fetchImpl: async () => { called += 1; throw new Error("不应调用"); } },
+  });
+  assert.equal(called, 0);
+  assert.equal(plain.provider, "heuristic");
+
+  const c = [mkCandidate("c1", "退款政策", "h1"), mkCandidate("c2", "保修12个月", "h2")];
+  const shadowFetch = async () => ({
+    ok: true,
+    json: async () => ({
+      results: [
+        { index: 1, relevance_score: 0.95 },
+        { index: 0, relevance_score: 0.2 },
+      ],
+      meta: { tokens: { input_tokens: 50 } },
+    }),
+  });
+  const out = await rerankCandidates({
+    candidates: c, query: "退款", queryTokens: ["退款"],
+    options: { provider: "siliconflow", shadow: true, threshold: 0.3, fetchImpl: shadowFetch },
+  });
+  assert.equal(out.provider, "heuristic", "shadow 不改变线上排序");
+  assert.equal(out.shadow.provider, "siliconflow");
+  assert.deepEqual(out.shadow.topScores, [0.95]);
+  assert.equal(out.shadow.topIds[0], "c2");
+  assert.equal(out.usage.input_tokens, 50);
+  assert.equal(out.ranked[0].rerankSource, "heuristic");
+});
+
+test("精排用量：从审计事件提取 live BGE token，不并入主账本", () => {
+  const events = [{
+    event: "rag_retrieved",
+    detail: {
+      stages: [
+        { stage: "query", tokens: 14 },
+        { stage: "rerank", provider: "siliconflow", mode: "live", kept: 2, threshold: 0.5, latencyMs: 208, usage: { input_tokens: 1035 } },
+      ],
+      degradations: [],
+    },
+  }];
+  const r = extractRerankUsage(events);
+  assert.equal(r.calls, 1);
+  assert.equal(r.provider, "siliconflow");
+  assert.equal(r.mode, "live");
+  assert.equal(r.inputTokens, 1035);
+  assert.equal(r.outputTokens, 0);
+  assert.equal(r.latencyMs, 208);
+  assert.equal(r.kept, 2);
+  assert.equal(r.degraded, false);
+  assert.equal(r.priced, false, "独立服务，不折算进主模型成本");
+});
+
+test("精排用量：空审计返回 0 调用并给可解释文案", () => {
+  const r = extractRerankUsage([]);
+  assert.equal(r.calls, 0);
+  assert.equal(r.inputTokens, 0);
+  assert.match(r.note, /未触发/);
+});
+
+test("精排用量：降级事件标记 degraded，不猜 token", () => {
+  const events = [{
+    event: "rag_retrieved",
+    detail: {
+      stages: [{ stage: "rerank", provider: "heuristic", mode: "live", kept: 5, threshold: 0.3 }],
+      degradations: [{ stage: "rerank", policy: "fail-open", reason: "HTTP 500" }],
+    },
+  }];
+  const r = extractRerankUsage(events);
+  assert.equal(r.degraded, true);
+  assert.equal(r.inputTokens, 0);
+  assert.equal(r.provider, "heuristic");
 });

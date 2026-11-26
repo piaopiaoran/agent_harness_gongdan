@@ -21,6 +21,17 @@ const schema = z.object({
   // 旧版 LangSmith Gateway 配置保留兼容；judge 已改为直连 TypeSafe（与 Smith 在线 evaluator 同 key / 同模型）。
   LANGSMITH_GATEWAY_BASE_URL: z.string().default("https://gateway.smith.langchain.com"),
 
+  // token → 成本：内置参考价格表可用 JSON 覆盖，格式为
+  // {"<model>":{"input":0.15,"output":0.6,"cachedInput":0.075}}，单位 USD / 1M tokens。
+  MODEL_PRICING_JSON: z.string().default("{}").refine((v) => {
+    try {
+      const parsed = JSON.parse(v);
+      return Boolean(parsed) && typeof parsed === "object" && !Array.isArray(parsed);
+    } catch {
+      return false;
+    }
+  }, "MODEL_PRICING_JSON 必须是 JSON 对象"),
+
   LLM_PROVIDER: z.enum(["fake", "openai"]).default("fake"),
   LLM_BASE_URL: z.string().default("https://api.openai.com/v1"),
   LLM_API_KEY: z.string().optional().default(""),
@@ -43,6 +54,18 @@ const schema = z.object({
   EMBEDDING_MODEL: z.string().default("BAAI/bge-m3"),
   EMBEDDING_DIMS: z.coerce.number().int().positive().default(1024),
   EMBEDDING_BATCH_SIZE: z.coerce.number().int().positive().default(32),
+
+  // 精排：主路 siliconflow（BGE-Reranker-v2-m3 cross-encoder）；heuristic 作为降级/离线兜底。
+  // SHADOW=true 时双跑并记录两种分数，但排序仍用 heuristic，不切流量。
+  RERANK_PROVIDER: z.enum(["heuristic", "siliconflow"]).default("siliconflow"),
+  RERANK_BASE_URL: z.string().default("https://api.siliconflow.cn/v1"),
+  RERANK_API_KEY: z.string().optional().default(""),
+  RERANK_MODEL: z.string().default("BAAI/bge-reranker-v2-m3"),
+  RERANK_TIMEOUT_MS: z.coerce.number().int().positive().default(8000),
+  RERANK_MAX_CHARS: z.coerce.number().int().positive().default(1600),
+  // BGE relevance_score 的分布与 heuristic sigmoid 完全不同，阈值独立标定（0.5 起步，需真实 query 回归）。
+  RERANK_API_THRESHOLD: z.coerce.number().min(0).max(1).default(0.5),
+  RERANK_SHADOW: z.string().default("false"),
 
   CONTEXT_WINDOW_TOKENS: z.coerce.number().int().positive().default(32000),
   CONTEXT_HEADROOM_RATIO: z.coerce.number().min(0.2).max(0.6).default(0.35),
@@ -139,10 +162,12 @@ if (!parsed.success) {
   throw new Error("Invalid environment configuration");
 }
 const env = parsed.data;
+// 价格表在启动期解析一次；非法结构已由 zod refine 拦截，这里不会再抛。
+const pricingOverrides = Object.freeze(JSON.parse(env.MODEL_PRICING_JSON));
 
 // 密钥单独保存，不进入 config 对象：防止 console.log(config)、错误堆栈、
 // trace metadata 或任何「整体展开配置」的地方把 key 带出去。
-const { LLM_API_KEY, EMBEDDING_API_KEY, LANGSMITH_API_KEY, JUDGE_API_KEY, ...publicEnv } = env;
+const { LLM_API_KEY, EMBEDDING_API_KEY, RERANK_API_KEY, LANGSMITH_API_KEY, JUDGE_API_KEY, ...publicEnv } = env;
 
 const useOpenAI = env.LLM_PROVIDER === "openai";
 if (useOpenAI && !LLM_API_KEY) {
@@ -153,6 +178,10 @@ const useRealEmbedding = env.EMBEDDING_PROVIDER === "siliconflow" && Boolean(EMB
 const embeddingEndpoint = useRealEmbedding
   ? assertSafeEndpoint(env.EMBEDDING_BASE_URL, "EMBEDDING_BASE_URL")
   : "local-fake";
+// rerank 复用 embedding 的那把 key，但端点是独立服务：只在真的走 API 时才校验。
+const rerankEndpoint = env.RERANK_PROVIDER === "siliconflow"
+  ? assertGatewayEndpoint(env.RERANK_BASE_URL, "RERANK_BASE_URL")
+  : "local";
 // judge 直连 TypeSafe：端点按普通 HTTPS 规则校验；缺 key 由 eval-smith.mjs 预检给可操作报错。
 const judgeBaseUrl = assertSafeEndpoint(env.JUDGE_BASE_URL, "JUDGE_BASE_URL");
 
@@ -182,6 +211,10 @@ export const config = Object.freeze({
   embeddingMode: useRealEmbedding ? "siliconflow" : "fake",
   llmEndpoint,
   embeddingEndpoint,
+  rerankEndpoint,
+  rerankMode: env.RERANK_SHADOW === "true" && env.RERANK_PROVIDER === "siliconflow"
+    ? "shadow"
+    : env.RERANK_PROVIDER,
   modelLabel: useOpenAI ? `${env.LLM_MODEL} @ ${llmEndpoint}` : "fake (本地确定性应答)",
   headroomTokens,
   usableTokens: env.CONTEXT_WINDOW_TOKENS - headroomTokens,
@@ -199,6 +232,10 @@ export const config = Object.freeze({
     enabled: env.LANGSMITH_TRACING === "true" && LANGSMITH_API_KEY.length > 0,
     project: env.LANGSMITH_PROJECT,
     endpoint: env.LANGSMITH_ENDPOINT,
+  }),
+  pricing: Object.freeze({
+    currency: "USD",
+    overrides: pricingOverrides,
   }),
   judge: Object.freeze({
     model: env.JUDGE_MODEL,
@@ -224,6 +261,7 @@ export function getSecret(name) {
   switch (name) {
     case "llm": return LLM_API_KEY;
     case "embedding": return EMBEDDING_API_KEY;
+    case "rerank": return RERANK_API_KEY || EMBEDDING_API_KEY;
     case "langsmith": return LANGSMITH_API_KEY;
     case "judge": return JUDGE_API_KEY;
     default: throw new Error(`unknown secret: ${name}`);

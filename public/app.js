@@ -264,6 +264,7 @@ function renderAll(data) {
   renderAudit(data.audit ?? []);
   renderRag(data.rag);
   renderContext(data.contextReport);
+  renderUsage(data.usage ?? state.last?.usage);
   renderLayers(data.audit ?? []);
   renderDecisions(data.audit ?? []);
 }
@@ -395,6 +396,77 @@ function renderContext(report) {
   trim.replaceChildren();
   for (const t of report.trimming ?? []) trim.append(el("div", "trimming-item", JSON.stringify(t)));
   if (!(report.trimming ?? []).length) trim.append(el("p", "empty", "未触发裁剪"));
+}
+
+function renderUsage(usage) {
+  const box = $("usage");
+  const summary = $("usageSummary");
+  const rerankBox = $("rerankUsage");
+  box.replaceChildren();
+  summary.replaceChildren();
+  if (rerankBox) rerankBox.replaceChildren();
+  renderRerankUsage(usage?.rerank, rerankBox);
+  if (!usage?.calls) {
+    box.append(el("p", "empty", "尚未调用模型"));
+    summary.append(el("p", "empty", "尚未调用模型"));
+    return;
+  }
+  const t = usage.tokens ?? {};
+  const money = usage.currency === "USD" ? `$${Number(usage.costUsd ?? 0).toFixed(6)}` : `${usage.costUsd ?? "n/a"} ${usage.currency ?? ""}`;
+  const chips = [
+    ["调用次数", `${usage.calls} 次`],
+    ["input", (t.inputTokens ?? 0).toLocaleString()],
+    ["output", (t.outputTokens ?? 0).toLocaleString()],
+    ["cached", (t.cachedTokens ?? 0).toLocaleString()],
+    ["合计 token", (t.totalTokens ?? 0).toLocaleString()],
+    ["参考成本", money],
+  ];
+  for (const [label, value] of chips) {
+    const chip = el("div", "usage-chip");
+    chip.append(el("span", "usage-chip-label", label), el("b", "", value));
+    summary.append(chip);
+  }
+  if (usage.unpricedCalls) {
+    summary.append(el("div", "hint-block", `${usage.unpricedCalls} 次调用无价格表匹配，未计入成本`));
+  }
+  for (const inv of usage.invocations ?? []) {
+    const item = el("div", "usage-item");
+    const head = el("div", "usage-head");
+    const it = inv.tokens ?? {};
+    head.append(
+      el("b", "", `第 ${inv.steps ?? "?"} 轮 · ${inv.model ?? ""}`),
+      el("span", "usage-tag", inv.source ?? "n/a"),
+    );
+    item.append(head);
+    item.append(el("div", "usage-line",
+      `input ${(it.inputTokens ?? 0).toLocaleString()}  ·  output ${(it.outputTokens ?? 0).toLocaleString()}  ·  cached ${(it.cachedTokens ?? 0).toLocaleString()}  ·  total ${(it.totalTokens ?? 0).toLocaleString()}`));
+    item.append(el("div", "usage-line muted",
+      `成本 ${typeof inv.costUsd === "number" ? `$${inv.costUsd.toFixed(6)}` : "n/a"}  ·  feature ${inv.feature ?? "-"}  ·  tenant ${inv.tenantId ?? "-"}`));
+    box.append(item);
+  }
+}
+
+function renderRerankUsage(rerank, box) {
+  if (!box) return;
+  if (!rerank?.calls) {
+    box.append(el("p", "empty", rerank?.note ?? "本次未调用精排模型"));
+    return;
+  }
+  const item = el("div", "usage-item rerank-item");
+  const head = el("div", "usage-head");
+  head.append(
+    el("b", "", `${rerank.provider ?? "-"} · ${rerank.model ?? "-"}`),
+    el("span", `usage-tag${rerank.degraded ? " usage-tag-warn" : ""}`, rerank.mode ?? "-"),
+  );
+  item.append(head);
+  item.append(el("div", "usage-line",
+    `调用 ${rerank.calls} 次  ·  input ${(rerank.inputTokens ?? 0).toLocaleString()}  ·  output ${(rerank.outputTokens ?? 0).toLocaleString()}  ·  保留 ${rerank.kept ?? "-"} 条`));
+  item.append(el("div", "usage-line muted",
+    `阈值 ${rerank.threshold ?? "-"}  ·  延迟 ${rerank.latencyMs ?? "-"} ms  ·  ${rerank.degraded ? "已降级，退回本地打分" : "无降级"}`));
+  item.append(el("div", "usage-line muted", "成本 未计入主模型账本（独立外部服务）"));
+  item.append(el("div", "usage-footnote", rerank.note ?? ""));
+  box.append(item);
+  box.append(el("p", "hint-block", "精排 token 不并入上方「合计 token / 参考成本」，两者不可相加。"));
 }
 
 function renderLayers(audit) {

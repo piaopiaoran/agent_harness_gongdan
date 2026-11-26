@@ -29,19 +29,53 @@ export function logTracingStatus() {
   }
 }
 
+/**
+ * LangSmith Threads / Turns 视图只认 metadata.thread_id；
+ * gen_ai.conversation.id 对应 OTel GenAI 语义规范，便于和其他可观测性工具对齐。
+ * 两者都写同一个 sessionId，不要只写 sessionId（Smith 不会据此聚合会话）。
+ */
 export function traceConfig(identity, extra = {}) {
+  const feature = identity.feature ?? "ticket";
   return {
     runName: extra.runName ?? PREFIX,
-    tags: [PREFIX, `project:${config.langsmith.project}`, `stage:${extra.stage ?? "ticket"}`],
+    tags: [
+      PREFIX,
+      `project:${config.langsmith.project}`,
+      `stage:${extra.stage ?? "ticket"}`,
+      `feature:${feature}`,
+      `tenant:${identity.tenantId}`,
+    ],
     metadata: {
+      thread_id: identity.sessionId,
+      "gen_ai.conversation.id": identity.sessionId,
       traceId: identity.traceId,
       sessionId: identity.sessionId,
       tenantId: identity.tenantId,
       userId: identity.userId,
       role: identity.role,
+      feature,
+      model: config.LLM_MODEL,
       modelMode: config.modelMode,
       embeddingMode: config.embeddingMode,
       ...(extra.metadata ?? {}),
+    },
+  };
+}
+
+/** 每次 LLM 调用的 child run 显式带上归因标签，不依赖父 run 继承。 */
+export function llmCallConfig(identity, { stage = "agent" } = {}) {
+  const feature = identity.feature ?? "ticket";
+  return {
+    tags: [`feature:${feature}`, `stage:${stage}`, `tenant:${identity.tenantId}`, `model:${config.LLM_MODEL}`],
+    metadata: {
+      thread_id: identity.sessionId,
+      "gen_ai.conversation.id": identity.sessionId,
+      traceId: identity.traceId,
+      sessionId: identity.sessionId,
+      tenantId: identity.tenantId,
+      userId: identity.userId,
+      feature,
+      stage,
     },
   };
 }
