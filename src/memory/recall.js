@@ -1,35 +1,47 @@
 import { config } from "../config.js";
 import { searchEpisodes, searchFacts } from "../db/queries.js";
+import { applyForgetting } from "./forget.js";
 
 /**
  * 在线召回：情景记忆与语义记忆并行检索，各自独立、分区块注入。
  * 严禁把两者混成一个向量库 —— 一个是「发生过什么」，一个是「稳定事实」。
  * 检索结果一律标注来源类型，便于回答时区分依据。
+ *
+ * 遗忘层：按 created_at 做半衰期衰减（默认 70 天），而不是无脑 top-k；
+ * 越久没被强化的记忆分数越低，跑越久也不会把检索槽位占满。
  */
-export async function recallMemories(embedder, { tenantId, userId, query }) {
+export async function recallMemories(embedder, { tenantId, userId, query, halfLifeDays } = {}) {
   if (!query) return { episodes: [], facts: [], trace: [] };
   const embedding = await embedder.embedQuery(query);
   const [epRes, factRes] = await Promise.allSettled([
-    searchEpisodes({ tenantId, userId, embedding, limit: 5 }),
-    searchFacts({ tenantId, userId, embedding, limit: 5 }),
+    searchEpisodes({ tenantId, userId, embedding, limit: 10 }),
+    searchFacts({ tenantId, userId, embedding, limit: 10 }),
   ]);
 
-  const episodes = (epRes.status === "fulfilled" ? epRes.value : []).map((e) => ({
-    sourceType: "episodic",
-    id: e.id,
-    text: `[情景:${e.goal}] ${e.summary}（结果：${e.outcome}）`,
-    similarity: Number(e.similarity ?? 0),
-    traceIds: e.source_trace_ids,
-    createdAt: e.created_at,
-  }));
-  const facts = (factRes.status === "fulfilled" ? factRes.value : []).map((f) => ({
-    sourceType: "semantic",
-    id: f.id,
-    text: `[事实:${f.category}] ${f.fact}`,
-    similarity: Number(f.similarity ?? 0),
-    confidence: f.confidence,
-    createdAt: f.created_at,
-  }));
+  const decayOpts = { halfLifeDays: halfLifeDays ?? config.memory.halfLifeDays };
+  const episodes = applyForgetting(
+    (epRes.status === "fulfilled" ? epRes.value : []).map((e) => ({
+      sourceType: "episodic",
+      id: e.id,
+      text: `[情景:${e.goal}] ${e.summary}（结果：${e.outcome}）`,
+      similarity: Number(e.similarity ?? 0),
+      traceIds: e.source_trace_ids,
+      createdAt: e.created_at,
+    })),
+    { ...decayOpts, limit: 5 }
+  );
+  const facts = applyForgetting(
+    (factRes.status === "fulfilled" ? factRes.value : []).map((f) => ({
+      sourceType: "semantic",
+      id: f.id,
+      text: `[事实:${f.category}] ${f.fact}`,
+      similarity: Number(f.similarity ?? 0),
+      confidence: f.confidence,
+      sourceKind: f.source_kind,
+      createdAt: f.created_at,
+    })),
+    { ...decayOpts, limit: 5 }
+  );
 
   return {
     episodes,

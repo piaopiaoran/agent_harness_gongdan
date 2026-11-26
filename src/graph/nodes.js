@@ -318,7 +318,8 @@ export function createNodes(deps) {
           messages: state.messages, finalAnswer: state.finalAnswer,
           toolCalls: state.toolResults ?? [],
         });
-        await queue.enqueue("distill", { tenantId: identity.tenantId }, 10);
+        // jobId = traceId：同一轮重试不会重复入队；真正去重落在 episode 幂等键。
+        await queue.enqueue("distill", { tenantId: identity.tenantId }, 10, `distill:${identity.traceId}`);
         await emit("recordTurn", "working_memory_appended", "allow", [], {
           messages: state.messages.length, distillQueued: true,
         });

@@ -126,7 +126,7 @@ estimateTokens(text) = ceil(汉字数 + 非汉字字符数 / 4)
 ### 4.3 记忆
 
 - `src/memory/recall.js:45-52`：远端摘要按 `maxChars = CTX_REMOTE_TOKENS * 2` 截字符
-- `src/memory/distiller.js:19-31`：独立 `ChatOpenAI`，`maxTokens: 2048`，`temperature 0.1`
+- `src/memory/distiller.js:18-44`：独立 `ChatOpenAI`，`DISTILL_LLM_MODEL`（默认跟随主模型，`.env` 显式 deepseek-flash）、**关 thinking**、`temperature: 0`、`response_format: json_object`、`maxTokens: DISTILL_MAX_TOKENS`（默认 768）
 - `src/graph/nodes.js:315`：`recordTurn` 里入队 `distill`，`DISTILL_BATCH_SIZE = 8`（config.js:71）
   ⚠️ 这条调用发生在主链之外，**不计入当轮 usage，也不在这条 turn trace 树里**
 

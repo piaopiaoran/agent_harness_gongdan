@@ -1,8 +1,15 @@
 import { END, START, StateGraph } from "@langchain/langgraph";
+import { config } from "../config.js";
 import { AgentState } from "./state.js";
 import { createNodes } from "./nodes.js";
 
-export const routeAfterInput = (s) => (s.verdict === "rejected" ? "reject" : "recallMemory");
+// memory-as-a-tool：默认不再每轮无条件两路向量召回；Agent 通过 recall_memory 工具按需取。
+// RECALL_MODE=eager 可回退到旧路径（便于 A/B 与面试对比「吸血鬼反模式」）。
+export const routeAfterInput = (s) => {
+  if (s.verdict === "rejected") return "reject";
+  if (config.memory.recallMode === "tool") return "retrieveRAG";
+  return "recallMemory";
+};
 export const routeAfterAgent = (s) => {
   if (["budget_exceeded", "model_error", "rejected"].includes(s.verdict)) return "reject";
   return s.verdict === "tool_calls" ? "toolGate" : "guardOutputNode";
@@ -49,7 +56,7 @@ export function buildGraph(deps) {
     .addNode("recordTurn", n.recordTurn)
 
     .addEdge(START, "guardInput")
-    .addConditionalEdges("guardInput", routeAfterInput, { reject: "reject", recallMemory: "recallMemory" })
+    .addConditionalEdges("guardInput", routeAfterInput, { reject: "reject", recallMemory: "recallMemory", retrieveRAG: "retrieveRAG" })
     .addEdge("recallMemory", "retrieveRAG")
     .addEdge("retrieveRAG", "assembleContext")
     .addEdge("assembleContext", "agent")

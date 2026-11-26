@@ -20,6 +20,22 @@ import {
 } from "../src/eval/judge.js";
 import { buildEvalDashboard } from "../src/eval/dashboard.js";
 import { buildDocumentCatalog } from "../src/rag/catalog.js";
+import { distillModelOptions } from "../src/memory/distiller.js";
+
+test("蒸馏模型：显式 deepseek-flash、关 thinking、强制 JSON、temperature 归零", () => {
+  const o = distillModelOptions({ ...config, DISTILL_LLM_MODEL: "deepseek-flash", DISTILL_MAX_TOKENS: 768 });
+  assert.equal(o.model, "deepseek-flash");
+  assert.equal(o.temperature, 0);
+  assert.equal(o.maxTokens, 768);
+  assert.deepEqual(o.modelKwargs.thinking, { type: "disabled" });
+  assert.deepEqual(o.modelKwargs.response_format, { type: "json_object" });
+  assert.equal(o.configuration.baseURL, config.LLM_BASE_URL);
+});
+
+test("蒸馏模型：未单独配置时跟随主模型", () => {
+  const o = distillModelOptions({ ...config, DISTILL_LLM_MODEL: "" });
+  assert.equal(o.model, config.LLM_MODEL);
+});
 
 test("分词保留词典专名与英文数字连续 token", () => {
   const tokens = segment("ORD-1001 左耳无声音，申请七天无理由退货");
@@ -388,6 +404,19 @@ test("BGE rerank：响应格式异常抛错而不是静默返回空", async () =
     () => rerankViaSiliconFlow([mkCandidate("c1", "x", "h1")], "q", { fetchImpl: fakeFetch }),
     /缺少 results/
   );
+});
+
+test("BGE rerank：全部分数低于阈值时保底保留 top1", async () => {
+  const c = [mkCandidate("c1", "物流签收", "h1"), mkCandidate("c2", "保修", "h2")];
+  const fakeFetch = async () => ({
+    ok: true,
+    json: async () => ({ results: [{ index: 1, relevance_score: 0.02 }, { index: 0, relevance_score: 0.01 }] }),
+  });
+  const out = await rerankViaSiliconFlow(c, "快递破损", {
+    threshold: 0.5, apiKey: "test", fetchImpl: fakeFetch,
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].row.id, "c2");
 });
 
 test("默认 heuristic 不发 API；shadow 双跑只记录分数、排序仍用基线", async () => {

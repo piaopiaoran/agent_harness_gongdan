@@ -41,6 +41,36 @@ const schema = z.object({
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
   LLM_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
 
+  // 蒸馏抽取器：独立配置 + 独立凭据 + 独立配额，模型可换但默认仍是 deepseek-flash。
+  // 未填的项回退到 LLM_*，便于「先隔离配置、再按需换模型」两步走。
+  DISTILL_MODEL: z.string().default(""),
+  DISTILL_BASE_URL: z.string().default(""),
+  DISTILL_API_KEY: z.string().optional().default(""),
+  DISTILL_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.1),
+  DISTILL_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  DISTILL_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(1),
+  // json_object 兼容 OpenAI 兼容端点（DeepSeek 支持）；schema 走严格 json_schema（OpenAI 原生）。
+  DISTILL_JSON_MODE: z.enum(["off", "object", "schema"]).default("object"),
+  // 换模型时改这里，模型版本随事实入库，避免静默漂移口径。
+  DISTILL_EXTRACTOR_VERSION: z.string().default("v2-consolidate-2026-11-26"),
+  DISTILL_CONSOLIDATE_LLM: z.string().default("true"),
+  DISTILL_DAILY_TOKEN_BUDGET: z.coerce.number().int().positive().default(200000),
+
+  // 记忆整合 / 遗忘：阈值与半衰期都是工程经验值，集中到配置便于标定。
+  FACT_MERGE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.82),
+  MEMORY_HALFLIFE_DAYS: z.coerce.number().positive().default(70),
+  MEMORY_MIN_SIMILARITY: z.coerce.number().min(0).max(1).default(0.05),
+  MEMORY_FACT_TTL_DAYS: z.coerce.number().int().positive().default(180),
+  MEMORY_EPISODE_TTL_DAYS: z.coerce.number().int().positive().default(90),
+  MEMORY_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(21600000),
+  // tool = Agent 按需召回（省每轮向量检索）；eager = 每轮无条件召回（旧行为，可回退）。
+  RECALL_MODE: z.enum(["tool", "eager"]).default("tool"),
+
+  // 队列可靠性：attempts/backoff/lease/dead-letter，替代「弹出即丢」。
+  QUEUE_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  QUEUE_BACKOFF_MS: z.coerce.number().int().positive().default(1000),
+  QUEUE_CLAIM_LEASE_MS: z.coerce.number().int().positive().default(120000),
+
   // 评测 judge：Jev（TypeSafe System One），离线与在线共用同一模型、同一把 key、同一套 question 名。
   // 直连 TypeSafe：key 放本机 .env（gitignored），Smith 在线 evaluator 用同名 workspace secret。
   JUDGE_API_KEY: z.string().optional().default(""),
@@ -63,8 +93,9 @@ const schema = z.object({
   RERANK_MODEL: z.string().default("BAAI/bge-reranker-v2-m3"),
   RERANK_TIMEOUT_MS: z.coerce.number().int().positive().default(8000),
   RERANK_MAX_CHARS: z.coerce.number().int().positive().default(1600),
-  // BGE relevance_score 的分布与 heuristic sigmoid 完全不同，阈值独立标定（0.5 起步，需真实 query 回归）。
-  RERANK_API_THRESHOLD: z.coerce.number().min(0).max(1).default(0.5),
+  // BGE relevance_score 的分布与 heuristic sigmoid 完全不同，阈值独立标定。
+  // 实测真实语料 top1 落在 0.05~0.93，取 0.05；rerank.js 另有 top1 保底。
+  RERANK_API_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
   RERANK_SHADOW: z.string().default("false"),
 
   CONTEXT_WINDOW_TOKENS: z.coerce.number().int().positive().default(32000),
@@ -91,6 +122,10 @@ const schema = z.object({
   MAX_STEPS: z.coerce.number().int().positive().default(14),
   MAX_WALL_MS: z.coerce.number().int().positive().default(60000),
 
+  // 记忆蒸馏：与主对话模型解耦。空字符串表示跟随 LLM_MODEL。
+  // 抽取是高频短结构化任务，DeepSeek V4 默认开启的 thinking 必须关掉（见 distiller.js）。
+  DISTILL_LLM_MODEL: z.string().default(""),
+  DISTILL_MAX_TOKENS: z.coerce.number().int().positive().default(768),
   DISTILL_BATCH_SIZE: z.coerce.number().int().positive().default(8),
   QUEUE_CONCURRENCY: z.coerce.number().int().positive().default(2),
 });
@@ -167,13 +202,20 @@ const pricingOverrides = Object.freeze(JSON.parse(env.MODEL_PRICING_JSON));
 
 // 密钥单独保存，不进入 config 对象：防止 console.log(config)、错误堆栈、
 // trace metadata 或任何「整体展开配置」的地方把 key 带出去。
-const { LLM_API_KEY, EMBEDDING_API_KEY, RERANK_API_KEY, LANGSMITH_API_KEY, JUDGE_API_KEY, ...publicEnv } = env;
+const { LLM_API_KEY, EMBEDDING_API_KEY, RERANK_API_KEY, LANGSMITH_API_KEY, JUDGE_API_KEY, DISTILL_API_KEY, ...publicEnv } = env;
 
 const useOpenAI = env.LLM_PROVIDER === "openai";
 if (useOpenAI && !LLM_API_KEY) {
   throw new Error("[config] LLM_PROVIDER=openai 但 LLM_API_KEY 为空；零成本演示请设 LLM_PROVIDER=fake");
 }
 const llmEndpoint = useOpenAI ? assertSafeEndpoint(env.LLM_BASE_URL, "LLM_BASE_URL") : "local";
+// 蒸馏端点可覆盖；未填时跟随 LLM。要求与 LLM 同样的 HTTPS / 无凭据约束。
+const distillBaseUrl = env.DISTILL_BASE_URL || env.LLM_BASE_URL;
+// DISTILL_LLM_MODEL 是早期别名，优先保留兼容；DISTILL_MODEL 是新的等价写法。
+const distillModel = env.DISTILL_MODEL || env.DISTILL_LLM_MODEL || env.LLM_MODEL;
+// 蒸馏凭据独立：未配置 DISTILL_API_KEY 时才回退主 LLM key（此时共享配额，文档里明示）。
+const distillKey = DISTILL_API_KEY || LLM_API_KEY;
+const distillEndpoint = distillKey ? assertSafeEndpoint(distillBaseUrl, "DISTILL_BASE_URL") : "local";
 const useRealEmbedding = env.EMBEDDING_PROVIDER === "siliconflow" && Boolean(EMBEDDING_API_KEY);
 const embeddingEndpoint = useRealEmbedding
   ? assertSafeEndpoint(env.EMBEDDING_BASE_URL, "EMBEDDING_BASE_URL")
@@ -216,6 +258,37 @@ export const config = Object.freeze({
     ? "shadow"
     : env.RERANK_PROVIDER,
   modelLabel: useOpenAI ? `${env.LLM_MODEL} @ ${llmEndpoint}` : "fake (本地确定性应答)",
+  distill: Object.freeze({
+    model: distillModel,
+    baseUrl: distillBaseUrl,
+    endpoint: distillEndpoint,
+    temperature: env.DISTILL_TEMPERATURE,
+    maxTokens: env.DISTILL_MAX_TOKENS,
+    timeoutMs: env.DISTILL_TIMEOUT_MS,
+    maxRetries: env.DISTILL_MAX_RETRIES,
+    jsonMode: env.DISTILL_JSON_MODE,
+    extractorVersion: env.DISTILL_EXTRACTOR_VERSION,
+    consolidateLlm: env.DISTILL_CONSOLIDATE_LLM === "true",
+    dailyTokenBudget: env.DISTILL_DAILY_TOKEN_BUDGET,
+    // 只表示「可用真模型」。共享 key 与独立 key 都可用，成本归因靠 label。
+    hasKey: Boolean(distillKey),
+    keyIsolated: Boolean(DISTILL_API_KEY) && DISTILL_API_KEY !== LLM_API_KEY,
+    label: distillKey ? `${distillModel} @ ${distillEndpoint}` : "fake (本地确定性应答)",
+  }),
+  memory: Object.freeze({
+    factMergeThreshold: env.FACT_MERGE_THRESHOLD,
+    halfLifeDays: env.MEMORY_HALFLIFE_DAYS,
+    minSimilarity: env.MEMORY_MIN_SIMILARITY,
+    factTtlDays: env.MEMORY_FACT_TTL_DAYS,
+    episodeTtlDays: env.MEMORY_EPISODE_TTL_DAYS,
+    sweepIntervalMs: env.MEMORY_SWEEP_INTERVAL_MS,
+    recallMode: env.RECALL_MODE,
+  }),
+  queue: Object.freeze({
+    maxAttempts: env.QUEUE_MAX_ATTEMPTS,
+    backoffMs: env.QUEUE_BACKOFF_MS,
+    claimLeaseMs: env.QUEUE_CLAIM_LEASE_MS,
+  }),
   headroomTokens,
   usableTokens: env.CONTEXT_WINDOW_TOKENS - headroomTokens,
   budget: Object.freeze({
@@ -248,6 +321,7 @@ export const config = Object.freeze({
     workingMemory: `${PREFIX}_working_memory`,
     episodes: `${PREFIX}_episodes`,
     semanticFacts: `${PREFIX}_semantic_facts`,
+    factHistory: `${PREFIX}_fact_history`,
     ragDocuments: `${PREFIX}_rag_documents`,
     ragChunks: `${PREFIX}_rag_chunks`,
     auditEvents: `${PREFIX}_audit_events`,
@@ -260,6 +334,7 @@ export const config = Object.freeze({
 export function getSecret(name) {
   switch (name) {
     case "llm": return LLM_API_KEY;
+    case "distill": return DISTILL_API_KEY || LLM_API_KEY;
     case "embedding": return EMBEDDING_API_KEY;
     case "rerank": return RERANK_API_KEY || EMBEDDING_API_KEY;
     case "langsmith": return LANGSMITH_API_KEY;

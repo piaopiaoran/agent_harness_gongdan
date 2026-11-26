@@ -57,13 +57,29 @@ CREATE TABLE IF NOT EXISTS agent_harness_gongdan_episodes (
   failure_points   TEXT[] NOT NULL DEFAULT '{}',
   source_trace_ids TEXT[] NOT NULL DEFAULT '{}',
   embedding        vector(1024),
+  -- 整合 / 遗忘 / 版本治理：幂等键、双时态、状态、抽取器版本。
+  idempotency_key  TEXT NOT NULL DEFAULT '',
+  extractor_version TEXT NOT NULL DEFAULT '',
+  valid_from       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  valid_to         TIMESTAMPTZ,
+  status           TEXT NOT NULL DEFAULT 'active', -- active | archived
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 老库补列（建表语句不会给已存在的表加列）：以下 ALTER 全部幂等。
+ALTER TABLE agent_harness_gongdan_episodes ADD COLUMN IF NOT EXISTS idempotency_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_harness_gongdan_episodes ADD COLUMN IF NOT EXISTS extractor_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_harness_gongdan_episodes ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE agent_harness_gongdan_episodes ADD COLUMN IF NOT EXISTS valid_to TIMESTAMPTZ;
+ALTER TABLE agent_harness_gongdan_episodes ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
 CREATE INDEX IF NOT EXISTS agent_harness_gongdan_episode_tenant_time_idx
   ON agent_harness_gongdan_episodes (tenant_id, user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS agent_harness_gongdan_episode_embedding_hnsw
   ON agent_harness_gongdan_episodes USING hnsw (embedding vector_cosine_ops)
   WITH (m = 16, ef_construction = 64);
+-- 幂等键：同一批原始消息重跑不会产生重复 episode；空串是历史行，不参与唯一约束。
+CREATE UNIQUE INDEX IF NOT EXISTS agent_harness_gongdan_episode_idem_idx
+  ON agent_harness_gongdan_episodes (tenant_id, user_id, idempotency_key)
+  WHERE idempotency_key <> '';
 
 -- ---------------------------------------------------------------------------
 -- 语义记忆：稳定事实 / 用户偏好 / 业务规则（Mem0 风格接口，PG 承载）
@@ -79,15 +95,52 @@ CREATE TABLE IF NOT EXISTS agent_harness_gongdan_semantic_facts (
   source_trace_id TEXT,
   embedding       vector(1024),
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- 双时态 + 冲突治理：同一事实的新版本不删除旧行，标 SUPERSEDED 并留 valid 区间。
+  valid_from      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  valid_to        TIMESTAMPTZ,
+  status          TEXT NOT NULL DEFAULT 'active', -- active | superseded | invalid | archived
+  superseded_by   UUID,
+  extractor_version TEXT NOT NULL DEFAULT '',
+  source_kind     TEXT NOT NULL DEFAULT 'user_said' -- user_said | agent_inferred | tool_returned
 );
-CREATE UNIQUE INDEX IF NOT EXISTS agent_harness_gongdan_fact_dedup_idx
-  ON agent_harness_gongdan_semantic_facts (tenant_id, user_id, category, fact);
+ALTER TABLE agent_harness_gongdan_semantic_facts ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE agent_harness_gongdan_semantic_facts ADD COLUMN IF NOT EXISTS valid_to TIMESTAMPTZ;
+ALTER TABLE agent_harness_gongdan_semantic_facts ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE agent_harness_gongdan_semantic_facts ADD COLUMN IF NOT EXISTS superseded_by UUID;
+ALTER TABLE agent_harness_gongdan_semantic_facts ADD COLUMN IF NOT EXISTS extractor_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_harness_gongdan_semantic_facts ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'user_said';
+-- 旧唯一索引覆盖所有状态：SUPERSEDED 的同文旧行会挡住新行写入。改为只在 active 上唯一。
+DROP INDEX IF EXISTS agent_harness_gongdan_fact_dedup_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS agent_harness_gongdan_fact_active_dedup_idx
+  ON agent_harness_gongdan_semantic_facts (tenant_id, user_id, category, fact)
+  WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS agent_harness_gongdan_fact_valid_idx
+  ON agent_harness_gongdan_semantic_facts (tenant_id, user_id, status, valid_to);
 CREATE INDEX IF NOT EXISTS agent_harness_gongdan_fact_tenant_idx
   ON agent_harness_gongdan_semantic_facts (tenant_id, user_id, category);
 CREATE INDEX IF NOT EXISTS agent_harness_gongdan_fact_embedding_hnsw
   ON agent_harness_gongdan_semantic_facts USING hnsw (embedding vector_cosine_ops)
   WITH (m = 16, ef_construction = 64);
+
+-- ---------------------------------------------------------------------------
+-- 事实变更轨迹：ADD / UPDATE / DELETE / NOOP 每次决策留痕（append-only 语义）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS agent_harness_gongdan_fact_history (
+  id              BIGSERIAL PRIMARY KEY,
+  tenant_id       TEXT NOT NULL,
+  user_id         TEXT NOT NULL,
+  fact_id         UUID,
+  op              TEXT NOT NULL,             -- ADD | UPDATE | DELETE | NOOP
+  fact            TEXT NOT NULL DEFAULT '',
+  reason          TEXT NOT NULL DEFAULT '',
+  similarity      REAL,
+  extractor_version TEXT NOT NULL DEFAULT '',
+  source_trace_id TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS agent_harness_gongdan_fact_history_tenant_idx
+  ON agent_harness_gongdan_fact_history (tenant_id, user_id, created_at DESC);
 
 -- ---------------------------------------------------------------------------
 -- RAG 文档（版本、来源、ACL）与 chunks（原文、tokens、tsvector、向量）
@@ -201,6 +254,7 @@ BEGIN
   FOREACH t IN ARRAY ARRAY[
     'agent_harness_gongdan_episodes',
     'agent_harness_gongdan_semantic_facts',
+    'agent_harness_gongdan_fact_history',
     'agent_harness_gongdan_rag_documents',
     'agent_harness_gongdan_rag_chunks'
   ]

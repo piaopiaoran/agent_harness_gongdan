@@ -103,6 +103,45 @@ export function priceUsage(usage, model = config.LLM_MODEL, meta = {}) {
   };
 }
 
+/**
+ * 进程级 token 预算：给蒸馏这类后台批处理单独设上限，避免上量后抢在线配额。
+ * 只按自然日累计（内存态，重启清零），真实生产应换成 Redis / PG 计数器。
+ */
+export function createTokenBudget({ dailyLimit = config.distill.dailyTokenBudget, now = () => Date.now() } = {}) {
+  let day = "";
+  let used = 0;
+  let records = 0;
+  const sync = () => {
+    const key = new Date(now()).toISOString().slice(0, 10);
+    if (key !== day) { day = key; used = 0; records = 0; }
+  };
+  sync();
+  return {
+    canSpend(estimated = 0) {
+      sync();
+      return used + Math.max(0, Number(estimated) || 0) <= dailyLimit;
+    },
+    record(usage) {
+      sync();
+      const total = Number(usage?.total_tokens)
+        ?? (Number(usage?.input_tokens) || 0) + (Number(usage?.output_tokens) || 0);
+      used += Math.max(0, total);
+      records += 1;
+      return this.status();
+    },
+    status() {
+      sync();
+      return {
+        date: day,
+        dailyLimit,
+        usedTokens: used,
+        remainingTokens: Math.max(0, dailyLimit - used),
+        calls: records,
+      };
+    },
+  };
+}
+
 /** 每次请求的账本：逐次明细 + 会话级汇总。只在内存，不跨进程持久化。 */
 export function createCostLedger(model = config.modelMode === "fake" ? "fake" : config.LLM_MODEL) {
   const invocations = [];

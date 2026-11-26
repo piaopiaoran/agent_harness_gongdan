@@ -50,7 +50,7 @@ flowchart TD
     K --> H
     J -- 否 --> L[最终回答：输出护栏截断4000字符]
     L --> M[recordTurn 写工作记忆]
-    M --> N["异步蒸馏：LLM 2048 maxTokens + 1~7 次 embedding"]
+    M --> N["异步蒸馏：LLM 768 maxTokens + 1~7 次 embedding（关 thinking）"]
     I --> O[LangSmith trace / check:smith 项目级 total_tokens]
 ```
 
@@ -194,7 +194,7 @@ overflow = total + headroom > window
 
 ### 3.5 主模型推理与工具循环
 
-- 模型构造：`src/llm/model.js:92-103`，`maxTokens: config.LLM_MAX_TOKENS`（代码默认 1024；`.env` 实际 3072）。README 解释：deepseek-flash 是 reasoning 模型，think 会吃输出预算，所以调高到 3072。
+- 模型构造：`src/llm/model.js:92-103`，`maxTokens: config.LLM_MAX_TOKENS`（代码默认 1024；`.env` 实际 3072）。主对话保留 thinking，思考会吃输出预算，故调高到 3072；蒸馏侧已关 thinking，见 3.6。
 - 调用超时：`src/llm/model.js:107-119`，`Promise.race` 硬超时 `LLM_TIMEOUT_MS + 2000`。
 - 每次入模：`src/graph/nodes.js:149` 用 `[SystemMessage(state.systemText), ...healed.messages]`，即**完整历史消息数组**；`repairMessageSequence()`（`:24-61`）会补写缺失的 ToolMessage，可能再增加一点 token。
 - 真实用量落地：`src/graph/nodes.js:160-161` 把 `reply.usage_metadata ?? null` 放进 `model_invoke` 审计事件的 `detail.usage`；`src/security/guard.js:50-63` 将其深拷贝进内存事件并写 `audit_events.detail`。
@@ -204,11 +204,11 @@ overflow = total + headroom > window
 ### 3.6 异步记忆蒸馏（`src/memory/distiller.js`）
 
 - 触发：`src/graph/nodes.js:315` 每轮 `queue.enqueue("distill", ..., 10)`（低优先级），`src/runtime.js:27-29` 注册 worker。
-- 单次调用（`:18-30`）：独立 `ChatOpenAI`，`temperature: 0.1`，**`maxTokens: 2048` 硬编码**，`maxRetries: 1`。
-- 输入（`:66-72`）：按 thread 聚合未蒸馏流水，`raw.slice(0, 6000)` 字符。
-- 输出（`:77-99`）：1 条 episode + `embedQuery(episodeText)`，最多 6 条 fact + 每条一次 `embedQuery(fact)` → 每个 thread **1 次 LLM + 1~7 次 embedding**。
-- 只解析 `content`，不解析 `reasoning_content`（`:32-38`），避免思考里的伪 JSON 污染记忆。
-- 失败 fail-open：保留 `distilled=false`，下一轮重试（`:101-104`），意味着失败重试会重复消耗 token。
+- 单次调用（`:28-49`）：`distillModelOptions()` 产出参数（纯函数，便于单测），模型取 `DISTILL_LLM_MODEL || LLM_MODEL`（`.env` 显式 `deepseek-flash`），`temperature: 0`，`maxTokens: DISTILL_MAX_TOKENS`（默认 768），`maxRetries: 1`；`modelKwargs` 同时下发 `thinking: {type:"disabled"}` 与 `response_format: {type:"json_object"}`。
+- 输入（`:85-91`）：按 thread 聚合未蒸馏流水，`raw.slice(0, 6000)` 字符。
+- 输出（`:96-118`）：1 条 episode + `embedQuery(episodeText)`，最多 6 条 fact + 每条一次 `embedQuery(fact)` → 每个 thread **1 次 LLM + 1~7 次 embedding**。
+- 关 thinking 后输出只有 `content`；`rawContent()`（`:52-57`）仍不解析 `reasoning_content`，作为上游万一重新开启思考时的防御。
+- 失败 fail-open：保留 `distilled=false`，下一轮重试（`:120-123`），意味着失败重试会重复消耗 token。
 
 ### 3.7 评测侧 token
 
@@ -341,7 +341,7 @@ curl -s -X POST http://localhost:3204/chat \
 7. **remote 两次都是字符截断**：先 2,000 字符，超限再 `B.remote * 2` = 2,000 字符，等于没变，实际并未压到 1,000 token。
 8. **systemText 与 report.total 口径不同**：total 含 recent，systemText 不含；证据标题/来源编号的格式 token 未计入 rag 区。
 9. **工具循环是 token 放大器**：每轮重发全量历史；`MAX_STEPS=14` 是上限，但单次 `usage_metadata` 只反映当轮，需自行跨事件求和。
-10. **reasoning 模型的 think 吃输出预算**：所以 `.env` 把 `LLM_MAX_TOKENS` 设为 3072；蒸馏任务另给 2048 硬编码值并只解析 `content`。
+10. **主对话的 think 吃输出预算**：`.env` 把 `LLM_MAX_TOKENS` 设为 3072；蒸馏侧通过 `modelKwargs` 关 thinking，`temperature: 0` 才真正生效，预算降到 `DISTILL_MAX_TOKENS=768`。
 11. **外部计费不在账内**：embedding（SiliconFlow）、Jev judge（TypeSafe）的 token 都不进本地预算；judge 只把 `input_tokens` 写进评论。
 12. **文档与实现有落差**：README 描述的「跨区动态调度顺序」目前体现为各区独立软上限 + 定向裁剪，没有实现按优先级抢占的跨区重排。
 13. **配置默认值与实际值不同**：`src/config.js` 的 `LLM_MAX_TOKENS` 默认是 1024，但 `.env` / `.env.example` 写的是 3072；只改代码默认会让 reasoning 模型更容易截断。
@@ -351,6 +351,10 @@ curl -s -X POST http://localhost:3204/chat \
 17. **精排 API 的用量不进主账**：`RERANK_PROVIDER=siliconflow` 时 `meta.tokens` 只写审计 trace；BGE 当前免费，但换按次计费的 reranker（如 Cohere `search_units`）必须单独计价，不能混进 `costLedger`。
 18. **两个 rerank 阈值不能互换**：`RAG_RERANK_THRESHOLD=0.30` 属于 heuristic 的 sigmoid 分数；BGE 的 `relevance_score` 虽然同为 0~1，分布不同，主路用 `RERANK_API_THRESHOLD=0.5`（shadow 起步值），必须按真实 query 集持续标定。
 19. **shadow 不等于灰度**：`RERANK_SHADOW=true` 时仍会真实调用 BGE API（产生用量和延迟），但排序结果不生效；关掉 shadow 才会把 BGE 分数用于证据筛选。
+20. **蒸馏独立账本**：`distillOnce` 的 usage 进 `runtime.distill.ledger`（与在线会话账本分开），`/health.memory.distillBudget` 看当日累计；默认 `DISTILL_DAILY_TOKEN_BUDGET=200000`，超限本轮跳过且**不标记 distilled**，下轮再试。
+21. **整合决策也计费**：`DISTILL_CONSOLIDATE_LLM=true` 时，每条命中相似事实的新增事实会额外调用一次 `deepseek-flash` 做 ADD/UPDATE/DELETE/NOOP 决策，usage 记在 `stage:consolidate`；`FACT_MERGE_THRESHOLD` 调低会显著增加这类调用。
+22. **重问会翻倍**：zod 校验失败时自动重问一次（`stage:extract` 第二次调用），失败率高的模型预算消耗接近两倍；`DISTILL_JSON_MODE=object` 对 DeepSeek 最稳。
+23. **遗忘不是删数据**：TTL 归档只改 `status/valid_to`，审计与 `fact_history` 仍占磁盘但不占检索槽位；半衰期只影响召回排序，不减少已入模的历史 token。
 
 ---
 
@@ -365,7 +369,7 @@ curl -s -X POST http://localhost:3204/chat \
 | `src/rag/retrieve.js` | 40-41, 76-102, 104-126 | 查询词元、召回、精排接入与 trace、证据 token 预算 |
 | `src/context/assemble.js` | 21-31, 44-65, 67-110, 112-126 | 六区预算、裁剪记录、溢出判定 |
 | `src/memory/recall.js` | 9-15, 44-54 | 查询 embedding、远端摘要字符上限 |
-| `src/memory/distiller.js` | 18-30, 50-108 | 蒸馏 2048 maxTokens、输入 6000 字符、embedding 次数 |
+| `src/memory/distiller.js` | 28-49, 69-123 | 蒸馏关 thinking / 768 maxTokens、输入 6000 字符、embedding 次数 |
 | `src/memory/working.js` | 3-21 | 原始流水只落库，不直接注入 prompt |
 | `src/llm/model.js` | 25-85, 92-103, 107-121 | fake/real 模型、`maxTokens`、超时、fake usage、调用级 config |
 | `src/observability/cost.js` | 10-19, 41-60, 63-104, 106-137 | 价格表 / 前缀匹配 / usage 计价 / 会话账本 |

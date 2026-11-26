@@ -12,7 +12,8 @@ import { createAuditor } from "./security/guard.js";
 import { buildGraph } from "./graph/buildGraph.js";
 import { distillOnce } from "./memory/distiller.js";
 import { traceConfig } from "./observability/tracing.js";
-import { createCostLedger } from "./observability/cost.js";
+import { createCostLedger, createTokenBudget } from "./observability/cost.js";
+import { createForgetScheduler } from "./memory/forget.js";
 
 /** 全局共享资源：连接池、模型、checkpointer、限流器、优先级队列与 worker。 */
 export async function createRuntime({ startWorker = true, forceMemoryCheckpointer = false } = {}) {
@@ -26,14 +27,23 @@ export async function createRuntime({ startWorker = true, forceMemoryCheckpointe
   }
   const rateLimiter = createRateLimiter();
   const queue = createPriorityQueue({ startWorker: false });
-  queue.register("distill", (payload) => distillOnce(embedder, payload));
+  // 蒸馏独立账本 + 日预算：批处理不并入在线会话账本，也不抢在线配额。
+  const distillLedger = createCostLedger(config.distill.model);
+  const distillBudget = createTokenBudget({ dailyLimit: config.distill.dailyTokenBudget });
+  queue.register("distill", (payload) => distillOnce(embedder, {
+    ...payload, costLedger: distillLedger, budget: distillBudget,
+  }));
   if (startWorker) queue.start();
+  // TTL 归档：6h 一轮（配置项），只做软归档与审计，不碰数据库进程。
+  const forget = createForgetScheduler({ autoStart: startWorker });
 
   return {
-    embedder, checkpointer, rateLimiter, queue,
+    embedder, checkpointer, rateLimiter, queue, forget,
+    distill: { ledger: distillLedger, budget: distillBudget },
     modelMode: config.modelMode,
     embeddingMode: config.embeddingMode,
     async close() {
+      forget.stop();
       await queue.stop();
       await rateLimiter.close();
       await closePool();
@@ -47,7 +57,7 @@ export function createSession(runtime, { tenantId = "tenant-a", userId = "u-1", 
     traceId: randomUUID(), sessionId, tenantId, userId, role, feature,
   };
   const auditor = createAuditor(identity);
-  const tools = createTools({ identity, traceId: identity.traceId });
+  const tools = createTools({ identity, traceId: identity.traceId, embedder: runtime.embedder });
   const model = createModel({ tools: tools.langchainTools });
   // 每次请求的账本：调用级真实 usage → 成本，随会话存活，不跨进程持久化。
   const costLedger = createCostLedger();

@@ -5,6 +5,7 @@ import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import { maskPII } from "./security/pii.js";
 import { insertRefundTicket } from "./db/queries.js";
+import { recallMemories } from "./memory/recall.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dataDir = join(here, "..", "data");
@@ -24,9 +25,10 @@ export const TOOL_META = {
   create_refund_ticket: { risk: "high", roles: ["user", "admin"], desc: "创建退款工单（资金动作，必须人工审批）" },
   send_email: { risk: "high", roles: ["admin"], desc: "对外发送邮件（需管理员 + 人工审批）" },
   export_all_orders: { risk: "forbidden", roles: [], desc: "导出全量订单（任何角色禁止）" },
+  recall_memory: { risk: "low", roles: ["user", "admin"], desc: "按需检索用户历史对话情景与稳定事实" },
 };
 
-export function createTools({ identity, traceId }) {
+export function createTools({ identity, traceId, embedder }) {
   const getOrderStatus = tool(
     async ({ orderId }) => {
       const all = await orders();
@@ -106,11 +108,32 @@ export function createTools({ identity, traceId }) {
     }
   );
 
-  // 模型只看到前三个工具；forbidden 工具存在于注册表但绝不 bind 给模型，
+  // memory-as-a-tool：Agent 自己判断何时需要历史记忆，省掉每轮无条件两路向量检索。
+  // tenant/user 从可信 identity 注入，不接收模型传入的 tenant（防横向越权）。
+  const recallMemoryTool = tool(
+    async ({ query }) => {
+      if (!embedder) return JSON.stringify({ episodes: [], facts: [], note: "embedder_unavailable" });
+      const r = await recallMemories(embedder, {
+        tenantId: identity.tenantId, userId: identity.userId,
+        query: String(query ?? "").slice(0, 500),
+      });
+      return JSON.stringify({
+        episodes: r.episodes.map((e) => ({ id: e.id, text: e.text, similarity: e.similarity })),
+        facts: r.facts.map((f) => ({ id: f.id, text: f.text, similarity: f.similarity, confidence: f.confidence })),
+      });
+    },
+    {
+      name: "recall_memory",
+      description: TOOL_META.recall_memory.desc + "（仅当前用户，入参为检索问题）",
+      schema: z.object({ query: z.string().min(1).describe("要回忆的问题，例如：我上次说的偏好是什么") }),
+    }
+  );
+
+  // 模型只看到白名单工具；forbidden 工具存在于注册表但绝不 bind 给模型，
   // 用来验证「即使模型幻觉出一个不在白名单里的工具，网关依然会拒绝」。
-  const langchainTools = [getOrderStatus, getRefundPolicy, createRefundTicket, sendEmail];
+  const langchainTools = [getOrderStatus, getRefundPolicy, createRefundTicket, sendEmail, recallMemoryTool];
   const registry = new Map(
-    [getOrderStatus, getRefundPolicy, createRefundTicket, sendEmail, exportAllOrders]
+    [getOrderStatus, getRefundPolicy, createRefundTicket, sendEmail, exportAllOrders, recallMemoryTool]
       .map((t) => [t.name, t])
   );
   return { registry, langchainTools, names: () => [...registry.keys()] };

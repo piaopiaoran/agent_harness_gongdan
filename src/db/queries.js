@@ -39,14 +39,19 @@ export async function markDistilled(ids) {
 // 情景记忆：蒸馏后的 episode 摘要
 // ---------------------------------------------------------------------------
 export async function insertEpisode(row) {
+  // 幂等：重跑同一批消息时，唯一索引 (tenant,user,idempotency_key) 冲突 → 返回 null，
+  // 调用方视为「已写入」并照常标记 distilled，避免重复 episode。
   return withTenant(row.tenantId, (c) => c.query(
     `INSERT INTO ${T.episodes}
-       (tenant_id, user_id, thread_id, goal, summary, outcome, failure_points, source_trace_ids, embedding)
-     VALUES ($1,$2,$3,$4,$5,$6,$7::text[],$8::text[],$9::vector)
+       (tenant_id, user_id, thread_id, goal, summary, outcome, failure_points, source_trace_ids,
+        embedding, idempotency_key, extractor_version)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::text[],$8::text[],$9::vector,$10,$11)
+     ON CONFLICT DO NOTHING
      RETURNING id, created_at`,
     [row.tenantId, row.userId, row.threadId, row.goal, row.summary, row.outcome,
-      row.failurePoints ?? [], row.sourceTraceIds ?? [], vectorLiteral(row.embedding)]
-  )).then((r) => r.rows[0]);
+      row.failurePoints ?? [], row.sourceTraceIds ?? [], vectorLiteral(row.embedding),
+      row.idempotencyKey ?? "", row.extractorVersion ?? ""]
+  )).then((r) => r.rows[0] ?? null);
 }
 
 export async function searchEpisodes({ tenantId, userId, embedding, limit = 5 }) {
@@ -55,6 +60,7 @@ export async function searchEpisodes({ tenantId, userId, embedding, limit = 5 })
             1 - (embedding <=> $3::vector) AS similarity
        FROM ${T.episodes}
       WHERE tenant_id = $1 AND user_id = $2 AND embedding IS NOT NULL
+        AND status = 'active' AND (valid_to IS NULL OR valid_to > now())
       ORDER BY embedding <=> $3::vector, created_at DESC
       LIMIT $4`,
     [tenantId, userId, vectorLiteral(embedding), limit]
@@ -67,21 +73,39 @@ export async function searchEpisodes({ tenantId, userId, embedding, limit = 5 })
 export async function upsertFact(row) {
   return withTenant(row.tenantId, (c) => c.query(
     `INSERT INTO ${T.semanticFacts}
-       (tenant_id, user_id, fact, category, confidence, source_trace_id, embedding)
-     VALUES ($1,$2,$3,$4,$5,$6,$7::vector)
+       (tenant_id, user_id, fact, category, confidence, source_trace_id, embedding,
+        extractor_version, source_kind)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9)
      ON CONFLICT DO NOTHING
-     RETURNING id`,
+     RETURNING id, created_at`,
     [row.tenantId, row.userId, row.fact, row.category ?? "preference",
-      row.confidence ?? 0.8, row.sourceTraceId ?? null, vectorLiteral(row.embedding)]
+      row.confidence ?? 0.8, row.sourceTraceId ?? null, vectorLiteral(row.embedding),
+      row.extractorVersion ?? "", row.sourceKind ?? "user_said"]
   )).then((r) => r.rows[0] ?? null);
+}
+
+/** 冲突判定：pgvector 余弦相似度找同用户 active 事实，阈值由 config 决定。 */
+export async function findSimilarFacts({ tenantId, userId, embedding, limit = 3, threshold = 0.82 }) {
+  return withTenant(tenantId, (c) => c.query(
+    `SELECT id, fact, category, confidence, created_at, valid_from,
+            1 - (embedding <=> $3::vector) AS similarity
+       FROM ${T.semanticFacts}
+      WHERE tenant_id = $1 AND user_id = $2 AND embedding IS NOT NULL
+        AND status = 'active' AND (valid_to IS NULL OR valid_to > now())
+        AND 1 - (embedding <=> $3::vector) >= $4
+      ORDER BY embedding <=> $3::vector
+      LIMIT $5`,
+    [tenantId, userId, vectorLiteral(embedding), threshold, limit]
+  )).then((r) => r.rows);
 }
 
 export async function searchFacts({ tenantId, userId, embedding, limit = 5 }) {
   return withTenant(tenantId, (c) => c.query(
-    `SELECT id, fact, category, confidence, created_at,
+    `SELECT id, fact, category, confidence, created_at, source_kind,
             1 - (embedding <=> $3::vector) AS similarity
        FROM ${T.semanticFacts}
       WHERE tenant_id = $1 AND user_id = $2 AND embedding IS NOT NULL
+        AND status = 'active' AND (valid_to IS NULL OR valid_to > now())
       ORDER BY embedding <=> $3::vector
       LIMIT $4`,
     [tenantId, userId, vectorLiteral(embedding), limit]
@@ -90,11 +114,74 @@ export async function searchFacts({ tenantId, userId, embedding, limit = 5 }) {
 
 export async function listFacts({ tenantId, userId, limit = 20 }) {
   return withTenant(tenantId, (c) => c.query(
-    `SELECT id, fact, category, confidence, created_at
-       FROM ${T.semanticFacts} WHERE user_id = $2
+    `SELECT id, fact, category, confidence, created_at, status, source_kind
+       FROM ${T.semanticFacts}
+      WHERE tenant_id = $1 AND user_id = $2 AND status = 'active'
       ORDER BY updated_at DESC LIMIT $3`,
     [tenantId, userId, limit]
   )).then((r) => r.rows);
+}
+
+/** 双时态更新：旧事实不删除，标 SUPERSEDED 并关闭 valid 区间，指向新行。 */
+export async function supersedeFact({ tenantId, id, newId, reason = "" }) {
+  return withTenant(tenantId, (c) => c.query(
+    `UPDATE ${T.semanticFacts}
+        SET status = 'superseded', valid_to = now(), superseded_by = $2, updated_at = now()
+      WHERE id = $1 AND tenant_id = $3 AND status = 'active'`,
+    [id, newId ?? null, tenantId]
+  )).then((r) => r.rowCount ?? 0);
+}
+
+/** 矛盾 / 过期事实标 INVALID；保留行与向量，后续不再召回。 */
+export async function invalidateFact({ tenantId, id, reason = "" }) {
+  return withTenant(tenantId, (c) => c.query(
+    `UPDATE ${T.semanticFacts}
+        SET status = 'invalid', valid_to = now(), updated_at = now()
+      WHERE id = $1 AND tenant_id = $2 AND status = 'active'`,
+    [id, tenantId]
+  )).then((r) => r.rowCount ?? 0);
+}
+
+export async function appendFactHistory(row) {
+  await withTenant(row.tenantId, (c) => c.query(
+    `INSERT INTO ${T.factHistory}
+       (tenant_id, user_id, fact_id, op, fact, reason, similarity, extractor_version, source_trace_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [row.tenantId, row.userId, row.factId ?? null, row.op, row.fact ?? "", row.reason ?? "",
+      row.similarity ?? null, row.extractorVersion ?? "", row.sourceTraceId ?? null]
+  ));
+}
+
+/** 工作记忆无 RLS：cron 需要从这里枚举租户，再逐租户带着 tenant context 归档。 */
+export async function listTenants() {
+  const r = await getPool().query(
+    `SELECT DISTINCT tenant_id FROM ${T.workingMemory} ORDER BY tenant_id`
+  );
+  return r.rows.map((x) => x.tenant_id);
+}
+
+/**
+ * TTL 归档：只改状态与 valid_to，历史仍可查；返回归档条数供观测。
+ * FORCE RLS 下必须在 withTenant 事务里执行，否则策略会静默过滤掉所有行。
+ */
+export async function archiveExpiredMemory({ factTtlDays, episodeTtlDays, tenantId }) {
+  return withTenant(tenantId, async (c) => {
+    const facts = await c.query(
+      `UPDATE ${T.semanticFacts} SET status = 'archived', valid_to = now(), updated_at = now()
+        WHERE status = 'active' AND valid_to IS NULL
+          AND tenant_id = $2
+          AND created_at < now() - ($1::int * INTERVAL '1 day')`,
+      [factTtlDays, tenantId]
+    );
+    const episodes = await c.query(
+      `UPDATE ${T.episodes} SET status = 'archived', valid_to = now()
+        WHERE status = 'active' AND valid_to IS NULL
+          AND tenant_id = $2
+          AND created_at < now() - ($1::int * INTERVAL '1 day')`,
+      [episodeTtlDays, tenantId]
+    );
+    return { facts: facts.rowCount ?? 0, episodes: episodes.rowCount ?? 0 };
+  });
 }
 
 // ---------------------------------------------------------------------------

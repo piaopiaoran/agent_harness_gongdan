@@ -95,8 +95,11 @@ export async function rerankViaSiliconFlow(candidates, query, {
     if (!c || !Number.isFinite(score)) continue;
     scored.push({ ...c, rerankScore: score, rerankSource: "cross-encoder" });
   }
-  const kept = scored.filter((c) => c.rerankScore >= threshold);
-  return dedupeByHash(kept).sort((a, b) => b.rerankScore - a.rerankScore);
+  // BGE 分数分布随语料与 query 变化，绝对阈值可能把候选全部滤掉；
+  // 此时保留 top1 作为保底，避免「精排成功但证据为空」的静默降质。
+  const sorted = dedupeByHash(scored).sort((a, b) => b.rerankScore - a.rerankScore);
+  const kept = sorted.filter((c) => c.rerankScore >= threshold);
+  return kept.length ? kept : sorted.slice(0, 1);
 }
 
 /**

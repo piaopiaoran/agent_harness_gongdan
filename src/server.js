@@ -121,7 +121,20 @@ export function buildApp(runtime) {
         rerankTopN: config.RAG_RERANK_TOPN, threshold: config.RAG_RERANK_THRESHOLD,
         evidenceMax: config.RAG_EVIDENCE_MAX,
       },
-      queue: { backend: runtime.queue.backend() },
+      queue: { backend: runtime.queue.backend(), ...runtime.queue.stats() },
+      memory: {
+        recallMode: config.memory.recallMode,
+        factMergeThreshold: config.memory.factMergeThreshold,
+        halfLifeDays: config.memory.halfLifeDays,
+        ttlDays: { episode: config.memory.episodeTtlDays, fact: config.memory.factTtlDays },
+        forget: runtime.forget?.status() ?? null,
+        distillBudget: runtime.distill?.budget.status() ?? null,
+      },
+      distill: {
+        model: config.distill.label, extractorVersion: config.distill.extractorVersion,
+        keyIsolated: config.distill.keyIsolated, jsonMode: config.distill.jsonMode,
+        consolidateLlm: config.distill.consolidateLlm,
+      },
       rateLimit: { backend: runtime.rateLimiter.backend(), perMin: config.RATE_LIMIT_PER_MIN },
       tools: Object.entries(TOOL_META).map(([name, meta]) => ({ name, ...meta })),
     });

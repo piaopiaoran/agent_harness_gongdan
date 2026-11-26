@@ -208,10 +208,29 @@ query 清洗截断512 → bge-m3 向量化 + jieba 风格分词
 
 - 语义记忆用 PG 表模拟 Mem0，精排用启发式替身 cross-encoder：接口对齐，便于面试时讲「换真服务只改一个模块」。
 - 没有 Lakera / LlamaGuard / Presidio / Casbin 的外部依赖：注入与 PII 用正则基线，RBAC 用策略表表达；生产应接真服务。
-- `deepseek-flash` 是 reasoning 模型，think 会吃 token，所以 `LLM_MAX_TOKENS=3072`；蒸馏任务单独给 2048 并只解析 `content`，不解析 `reasoning_content`。
+- 主对话 `deepseek-flash` 保留 thinking（工具规划需要），`LLM_MAX_TOKENS=3072`；记忆蒸馏单独配 `DISTILL_LLM_MODEL=deepseek-flash` **并显式关 thinking**（`temperature: 0` + `response_format: json_object` + `DISTILL_MAX_TOKENS=768`）。抽取是高频短结构化任务，思考只增延迟与 JSON 解析失败率；旧的 `deepseek-chat` 是非思考别名，已于 2026-07-24 下线。
 - LangSmith key 有效，trace 已实际写入 `agent_harness_gongdan` 项目（metadata 带 `traceId` / `tenantId` / `sessionId`，可与 DB 审计表双向定位）。注意 `/api/v1/sessions` 是废弃端点，对有效 key 也会返回 `401 Invalid token`；自检请用 `npm run check:smith`（走 SDK 的 v2 端点）。
 - 模拟订单在 `data/orders.json`，知识文档在 `data/docs/`，可自行替换。
 - 换 embedding 模型必须重建索引；本项目维度固定 1024，配置里改维度会在启动时校验失败。
+
+### 记忆蒸馏对齐生产环境（2026-11-26）
+
+按「行业生产环境对比」把 P0/P1 补齐，抽取模型**仍是 `deepseek-flash`**，变的是周边治理：
+
+| 维度 | 现在的实现 | 配置项 / 文件 |
+|---|---|---|
+| 结构化输出 | JSON mode + zod 严格校验 + 解析失败重问一次 | `DISTILL_JSON_MODE`、`src/memory/distiller.js` |
+| 整合 | `findSimilarFacts` 余弦阈值判定 → ADD/UPDATE/DELETE/NOOP；旧事实标 `SUPERSEDED`/`INVALID` 并关闭 `valid_to`，`fact_history` 留痕 | `FACT_MERGE_THRESHOLD=0.82`、`src/memory/consolidate.js` |
+| 遗忘 | 召回按 70 天半衰期衰减；90/180 天 TTL 软归档 + 6h cron 扫描 | `MEMORY_*`、`src/memory/forget.js` |
+| 幂等 | episode `(tenant,user,idempotency_key)` 唯一索引 + 队列 `jobId` 去重；整合/归档全程事务 | `db/schema.sql`、`src/queue/priority.js` |
+| 版本 / 来源 | 事实带 `extractor_version` / `source_kind` / confidence，模型版本随事实入库 | `DISTILL_EXTRACTOR_VERSION` |
+| 模型隔离 | `DISTILL_MODEL` / `DISTILL_BASE_URL` / `DISTILL_API_KEY` 独立；未填 key 则共享主 key（配额未隔离） | `config.distill` |
+| 召回 | `RECALL_MODE=tool`（默认）Agent 按需调 `recall_memory`；`eager` 回退每轮无条件召回 | `RECALL_MODE`、`src/tools.js` |
+| 可靠性 | Lua 原子领取 + ack + attempts/backoff + 租约回收 + 死信队列 | `QUEUE_*`、`src/queue/priority.js` |
+| 成本 | 蒸馏独立 costLedger + 日 token 预算（默认 20 万），超限跳过不抢在线配额 | `DISTILL_DAILY_TOKEN_BUDGET` |
+
+`/health.memory` 暴露召回模式、半衰期、TTL、归档状态与蒸馏预算；`/health.queue` 暴露队列后端与 ack/retry/dead 计数。
+注意：预算账本是进程内内存态，重启清零；生产应换 Redis/PG 计数器并接 OTel/Grafana 告警。
 
 ---
 
