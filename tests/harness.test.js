@@ -9,6 +9,7 @@ import { maskPII, maskToolArgs } from "../src/security/pii.js";
 import { guardInput, guardOutput } from "../src/security/guard.js";
 import { authorizeTool } from "../src/security/rbac.js";
 import { assembleContext } from "../src/context/assemble.js";
+import * as budgets from "../src/context/budget.js";
 import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 import { unansweredToolReplies, repairMessageSequence } from "../src/graph/nodes.js";
 import { resolveSessionId, extractRerankUsage } from "../src/server.js";
@@ -493,4 +494,51 @@ test("精排用量：降级事件标记 degraded，不猜 token", () => {
   assert.equal(r.degraded, true);
   assert.equal(r.inputTokens, 0);
   assert.equal(r.provider, "heuristic");
+});
+
+test("上下文预算：三档硬顶生效，窗口只抬上限不放大分区", () => {
+  const { computeBudget, selectContextProfile } = budgets;
+  // 1M 窗口下，六区都应由硬顶收敛，而不是按比例膨胀
+  const i = computeBudget({ window: 1048576, profile: "interactive" });
+  assert.equal(i.system, 8192);
+  assert.equal(i.recent, 10240);
+  assert.ok(i.assemblyCap < 32000, `交互档装配量应小于 32K，实际 ${i.assemblyCap}`);
+
+  const a = computeBudget({ window: 1048576, profile: "analysis" });
+  assert.ok(a.assemblyCap > 90000 && a.assemblyCap < 100000, `分析档应约 96K，实际 ${a.assemblyCap}`);
+
+  const l = computeBudget({ window: 1048576, profile: "longdoc" });
+  assert.ok(l.assemblyCap >= 200000, `长文档档应 ≥200K，实际 ${l.assemblyCap}`);
+
+  // 小窗口时比例反过来成为约束：同一套结构不改，只是被 A 压小
+  const small = computeBudget({ window: 32000, profile: "interactive" });
+  assert.ok(small.system < 8192, "32K 窗口下前缀应被比例压到硬顶以下");
+  assert.equal(small.overflowAt !== undefined, true);
+
+  // 输出预留按档位：思考 token 计入输出，分析档预留更大
+  assert.equal(i.outputReserve, 16384);
+  assert.equal(a.outputReserve, 65536);
+
+  // 档位选择：默认交互；明确的长文档意图才升档；longdoc 只能显式
+  assert.equal(selectContextProfile("退款政策是什么", "auto"), "interactive");
+  assert.equal(selectContextProfile("帮我把这份规范全文读完再总结", "auto"), "analysis");
+  assert.equal(selectContextProfile("读这个百万字语料", "auto"), "interactive", "最贵档不自动升");
+  assert.equal(selectContextProfile("退款政策是什么", "longdoc"), "longdoc");
+});
+
+test("上下文装配：按档位出报告，装配量不越过本档能力", () => {
+  const r = assembleContext({
+    systemPrompt: "你是售后助手",
+    agentState: { step: 1 },
+    recentMessages: [new HumanMessage("查订单"), new AIMessage("请提供订单号")],
+    memories: { episodes: [], facts: [] },
+    ragEvidence: [{ id: "[证据1]", source: "政策", content: "七天无理由", tokens: 10 }],
+    remoteEpisodes: [],
+    question: "帮我把这份售后规范全文读一遍",
+  });
+  assert.equal(r.report.profile, "analysis");
+  assert.ok(r.report.total <= r.report.assemblyCap);
+  assert.equal(r.report.overflow, false);
+  // 末尾锚点必须在系统消息里，对抗 lost in the middle
+  assert.match(r.systemMessage.content, /本轮任务/);
 });

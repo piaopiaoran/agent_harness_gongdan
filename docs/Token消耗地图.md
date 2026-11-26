@@ -52,38 +52,43 @@ provider 实际 input_tokens               : 14,754
 ```
 
 `report.total = {system:203, state:39, recent:4000, memory:603, rag:1026, remote:374}`
-这组数字看起来非常健康（6.2K 远低于 usable 20.8K），但真实 prompt 是 14.7K。**也就是说上下文溢出检测永远为 false，等于没有。**
+这组数字看起来非常健康（6.2K 远低于 interactive 档装配上限 30.7K），但真实 prompt 是 14.7K。**也就是说上下文溢出检测永远为 false，等于没有。**
 
 ---
 
 ## 三、输入侧：配额是怎么定的
 
-参数都在 `src/config.js:47-68`，`.env` 已全部显式覆盖。
+参数在 `src/config.js`（zod 启动期校验），预算由 `src/context/budget.js` 计算；2026-11-26 起从「固定绝对值」改为「比例 × A 与硬顶取小」。
 
 **窗口与预留**
 
-- `CONTEXT_WINDOW_TOKENS = 32000`（config.js:47）
-- `CONTEXT_HEADROOM_RATIO = 0.35`（config.js:48）
-- 由 config.js:174-187 换算出：`headroomTokens = 11200`，`usableTokens = 20800`
+- `CONTEXT_WINDOW_TOKENS = 1048576`（deepseek-flash = DeepSeek-V4.1-Flash 的标称窗口，只作上限）
+- `CONTEXT_OUTPUT_RESERVE = 16384`（交互档；分析 / 长文档档 65536）
+- `CONTEXT_SAFETY_MARGIN = 0.10`
+- 换算：`A = (窗口 − 输出预留) × 0.90`；每个区 = `min(比例 × A, 硬顶)`
 
-**六个区块的软上限（config.js:188-197，合计 10,500）**
+**六个区块（默认 interactive 档；括号内为比例与硬顶）**
 
-- `system 2000`：系统指令，不压缩、不裁剪（assemble.js:44-46）
-- `state 500`：Agent State 紧凑 JSON，`stateText.slice(0, B.state * 4)` 按字符折算（assemble.js:49-51）
-- `recent 4000`：近程轨迹，**只统计不裁剪**（见第五节缺口 1）
-- `memory 1500`：检索记忆，按相似度从低到高丢弃（assemble.js:71-86）
-- `rag 1500`：检索证据，最多 6 块（assemble.js:89-101）
-- `remote 1000`：远端摘要，有损截断 `slice(0, B.remote * 2)`（assemble.js:104-110）
+- `system 8192`（0.15 / 8192）：系统指令，不压缩、不裁剪
+- `state 2048`（0.035 / 2048）：Agent State 紧凑 JSON，按字符折算
+- `memory 4096`（0.12 / 4096）：检索记忆，按相似度从低到高丢弃
+- `rag 4096`（0.10 / 4096）：检索证据，最多 6 块
+- `recent 10240`（0.32 / 10240）：近程轨迹，超限先丢最旧、保留首轮
+- `remote 2048`（0.09 / 2048）：远端摘要，有损截断
+- 缓冲 8192（headroom 固定值，不按比例）
+
+1M 窗口下六区全部由硬顶收敛（装配量 30,720）；analysis 档 94,208、longdoc 档 200,704，三档都远小于窗口，这是刻意的：1M 是容量上限，不是可用容量。
 
 **token 估算函数（不是真 tokenizer）**
 
-`src/rag/segment.js:68-72`：
+`src/rag/segment.js`：
 
 ```
-estimateTokens(text) = ceil(汉字数 + 非汉字字符数 / 4)
+estimateTokens(text)      = ceil(汉字数 + 非汉字字符数 / 4)
+estimateTokensUpper(text) = ceil(estimateTokens(text) * 1.1)   ← 预算实际使用这一档
 ```
 
-即「一个汉字算 1 token、4 个英文字符算 1 token」。这是字数近似，与 DeepSeek 真实 tokenizer 有偏差，全项目所有预算判断都建立在这个函数上。
+「一个汉字算 1 token、4 个英文字符算 1 token」，再加 10% 上界。标准里的 `chars/1.8` 兜底没有启用：它对非中文文本会高估约 2 倍，会把纯英文轨迹砍掉一半，只在实测偏差超 10% 时按语料类型单独标定。
 
 **两个没被配额覆盖的隐性输入（实测约 8.5K）**
 
@@ -119,13 +124,13 @@ estimateTokens(text) = ceil(汉字数 + 非汉字字符数 / 4)
 - `src/config.js:56` `RAG_CHUNK_TOKENS = 512`，`RAG_CHUNK_OVERLAP = 0.15`（ingest.js:12-32 按段切块）
 - `src/rag/ingest.js:66` 入库字段 `tokens: segment(v.content).length`，是**分词后的词数**，不是模型 token
 - `src/config.js:62` `RAG_EVIDENCE_MAX = 6`、`RAG_EVIDENCE_CHUNK_TOKENS = 800`
-- `src/rag/retrieve.js:114-136`：单块 `slice(0, 800 * 2)` 字符、总数受 `budgetTokens = CTX_RAG_TOKENS = 1500` 限制
+- `src/rag/retrieve.js:114-136`：单块 `slice(0, 800 * 2)` 字符、总数受 `budgetTokens = config.budget.rag = 4096` 限制
   ⚠️ 不自洽：6 块 × 800 token = 4,800 的名义上限，被 1,500 的总预算实际压在 1–2 块
 - `src/rag/retrieve.js:103`：`RAG_RERANK_TOPN = 20` 进精排，精排本身不花模型 token（启发式替身），接真 cross-encoder 后会产生额外调用成本
 
 ### 4.3 记忆
 
-- `src/memory/recall.js:45-52`：远端摘要按 `maxChars = CTX_REMOTE_TOKENS * 2` 截字符
+- `src/memory/recall.js:45-52`：远端摘要按 `maxChars = config.budget.remote * 2 = 4096` 字符 截字符
 - `src/memory/distiller.js:18-44`：独立 `ChatOpenAI`，`DISTILL_LLM_MODEL`（默认跟随主模型，`.env` 显式 deepseek-flash）、**关 thinking**、`temperature: 0`、`response_format: json_object`、`maxTokens: DISTILL_MAX_TOKENS`（默认 768）
 - `src/graph/nodes.js:315`：`recordTurn` 里入队 `distill`，`DISTILL_BATCH_SIZE = 8`（config.js:71）
   ⚠️ 这条调用发生在主链之外，**不计入当轮 usage，也不在这条 turn trace 树里**
@@ -209,7 +214,7 @@ DeepSeek 上下文缓存按前缀命中自动生效，命中后这部分按缓�
 
 **P1 · 修 RAG 预算不自洽**
 
-要么把 `CTX_RAG_TOKENS` 提到 4,800 让 6 块真能进，要么把 `RAG_EVIDENCE_CHUNK_TOKENS` 降到 250 保持 6×250=1500。现在这套是「以为给了 6 块、实际只进 1–2 块」，检索召回被人为砍掉。
+interactive 档 rag 预算 4096、单块 800 token，实际最多进 5 块；要让 6 块全进，把 `RAG_EVIDENCE_CHUNK_TOKENS` 降到 683 以下，或把该请求放到 analysis 档（rag 12288）。否则就是「以为给了 6 块、实际只进 1–2 块」，检索召回被人为砍掉。
 
 **P2 · 补齐账本（1 天）**
 

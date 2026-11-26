@@ -28,7 +28,7 @@ export function rrfFuse(lists, k = config.RAG_RRF_K) {
  *   精排异常 fail-open 回 RRF；关键词路异常 fail-open 退纯向量；
  *   两路都不可用 fail-close 拒答；权限过滤异常由 withTenant 抛出 → fail-close。
  */
-export async function retrieveEvidence(embedder, rawQuery, { tenantId, budgetTokens = config.CTX_RAG_TOKENS } = {}) {
+export async function retrieveEvidence(embedder, rawQuery, { tenantId, budgetTokens = config.budget.rag } = {}) {
   const trace = { stages: [], degradations: [] };
   const clean = normalizeInput(rawQuery).text;
   const queryTokens = segment(clean).slice(0, 512);

@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { computeAllProfiles } from "./context/budget.js";
 
 /**
  * 配置即策略。
@@ -98,14 +99,20 @@ const schema = z.object({
   RERANK_API_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
   RERANK_SHADOW: z.string().default("false"),
 
-  CONTEXT_WINDOW_TOKENS: z.coerce.number().int().positive().default(32000),
-  CONTEXT_HEADROOM_RATIO: z.coerce.number().min(0.2).max(0.6).default(0.35),
-  CTX_SYSTEM_TOKENS: z.coerce.number().int().positive().default(2000),
-  CTX_STATE_TOKENS: z.coerce.number().int().positive().default(500),
-  CTX_RECENT_TOKENS: z.coerce.number().int().positive().default(4000),
-  CTX_MEMORY_TOKENS: z.coerce.number().int().positive().default(1500),
-  CTX_RAG_TOKENS: z.coerce.number().int().positive().default(1500),
-  CTX_REMOTE_TOKENS: z.coerce.number().int().positive().default(1000),
+  // 上下文预算：窗口只作不可越过的上限，实际分配走「比例 × A 与硬顶取小」，见 context/budget.js。
+  // 默认按 deepseek-flash（DeepSeek-V4.1-Flash）的 1M 标称窗口；换模型只改这里。
+  CONTEXT_WINDOW_TOKENS: z.coerce.number().int().positive().default(1048576),
+  CONTEXT_OUTPUT_RESERVE: z.coerce.number().int().positive().default(16384),
+  CONTEXT_SAFETY_MARGIN: z.coerce.number().min(0).max(0.4).default(0.10),
+  CONTEXT_PROFILE: z.enum(["auto", "interactive", "analysis", "longdoc"]).default("auto"),
+  // 分区硬顶可覆盖（实测衰减曲线后收敛）；不填则用 budget.js 的档位表。
+  CONTEXT_CAP_SYSTEM: z.coerce.number().int().positive().optional(),
+  CONTEXT_CAP_STATE: z.coerce.number().int().positive().optional(),
+  CONTEXT_CAP_MEMORY: z.coerce.number().int().positive().optional(),
+  CONTEXT_CAP_RAG: z.coerce.number().int().positive().optional(),
+  CONTEXT_CAP_RECENT: z.coerce.number().int().positive().optional(),
+  CONTEXT_CAP_REMOTE: z.coerce.number().int().positive().optional(),
+  CONTEXT_CAP_HEADROOM: z.coerce.number().int().positive().optional(),
 
   RAG_CHUNK_TOKENS: z.coerce.number().int().positive().default(512),
   RAG_CHUNK_OVERLAP: z.coerce.number().min(0).max(0.5).default(0.15),
@@ -241,10 +248,33 @@ process.env.LANGCHAIN_ENDPOINT = env.LANGSMITH_ENDPOINT;
 export const PREFIX = "agent_harness_gongdan";
 /** LangGraph 官方 PostgresSaver 表名硬编码，只能改 schema；用独立 schema 做命名空间隔离。 */
 export const CHECKPOINT_SCHEMA = PREFIX;
-/** 共享的 headroom 比例：所有区块共享一个窗口，预留输出 / 工具返回膨胀 / 运行时追加。 */
-export const headroomTokens = Math.floor(
-  env.CONTEXT_WINDOW_TOKENS * env.CONTEXT_HEADROOM_RATIO
-);
+
+/**
+ * 上下文分档：三档各自算好一份预算，请求期按 selectContextProfile 选档。
+ * 窗口（1M）只作上限；硬顶才是"有效上下文"的真实约束，所以窗口变大不会让各分区无限膨胀。
+ */
+const capOverrides = {
+  ...(env.CONTEXT_CAP_SYSTEM ? { system: env.CONTEXT_CAP_SYSTEM } : {}),
+  ...(env.CONTEXT_CAP_STATE ? { state: env.CONTEXT_CAP_STATE } : {}),
+  ...(env.CONTEXT_CAP_MEMORY ? { memory: env.CONTEXT_CAP_MEMORY } : {}),
+  ...(env.CONTEXT_CAP_RAG ? { rag: env.CONTEXT_CAP_RAG } : {}),
+  ...(env.CONTEXT_CAP_RECENT ? { recent: env.CONTEXT_CAP_RECENT } : {}),
+  ...(env.CONTEXT_CAP_REMOTE ? { remote: env.CONTEXT_CAP_REMOTE } : {}),
+  ...(env.CONTEXT_CAP_HEADROOM ? { headroom: env.CONTEXT_CAP_HEADROOM } : {}),
+  ...(env.CONTEXT_OUTPUT_RESERVE !== 16384 ? { outputReserve: env.CONTEXT_OUTPUT_RESERVE } : {}),
+};
+export const contextProfiles = computeAllProfiles({
+  window: env.CONTEXT_WINDOW_TOKENS,
+  safetyMargin: env.CONTEXT_SAFETY_MARGIN,
+  capOverrides,
+});
+export const defaultContextProfile = env.CONTEXT_PROFILE === "auto"
+  ? "interactive"
+  : env.CONTEXT_PROFILE;
+/** 默认档预算：用于 /health、未指定档位的调用方（例如脚本、测试）。 */
+export const contextBudget = contextProfiles[defaultContextProfile];
+/** 共享的 headroom：六区共享同一窗口，预留输出 / 工具返回膨胀 / 运行时追加。 */
+export const headroomTokens = contextBudget.headroom;
 
 export const config = Object.freeze({
   ...publicEnv,
@@ -290,16 +320,30 @@ export const config = Object.freeze({
     claimLeaseMs: env.QUEUE_CLAIM_LEASE_MS,
   }),
   headroomTokens,
-  usableTokens: env.CONTEXT_WINDOW_TOKENS - headroomTokens,
+  usableTokens: contextBudget.available,
   budget: Object.freeze({
-    system: env.CTX_SYSTEM_TOKENS,
-    state: env.CTX_STATE_TOKENS,
-    recent: env.CTX_RECENT_TOKENS,
-    memory: env.CTX_MEMORY_TOKENS,
-    rag: env.CTX_RAG_TOKENS,
-    remote: env.CTX_REMOTE_TOKENS,
-    headroom: headroomTokens,
+    profile: contextBudget.profile,
+    window: contextBudget.window,
+    outputReserve: contextBudget.outputReserve,
+    safetyMargin: contextBudget.safetyMargin,
+    ratios: contextBudget.ratios,
+    caps: contextBudget.caps,
+    system: contextBudget.system,
+    state: contextBudget.state,
+    memory: contextBudget.memory,
+    rag: contextBudget.rag,
+    recent: contextBudget.recent,
+    remote: contextBudget.remote,
+    headroom: contextBudget.headroom,
+    assemblyCap: contextBudget.assemblyCap,
+  }),
+  // 三档预算全量暴露：审计与 /health 用，不在请求期重复计算。
+  context: Object.freeze({
     window: env.CONTEXT_WINDOW_TOKENS,
+    safetyMargin: env.CONTEXT_SAFETY_MARGIN,
+    requestedProfile: env.CONTEXT_PROFILE,
+    defaultProfile: defaultContextProfile,
+    profiles: contextProfiles,
   }),
   langsmith: Object.freeze({
     enabled: env.LANGSMITH_TRACING === "true" && LANGSMITH_API_KEY.length > 0,

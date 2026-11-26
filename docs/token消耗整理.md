@@ -95,10 +95,12 @@ export function estimateTokens(text) {
 `src/config.js:47-63` 定义环境变量默认值（zod 启动期校验），`src/config.js:174-197` 计算出运行时预算：
 
 ```js
-headroomTokens = floor(32000 * 0.35) = 11200
-usableTokens   = 32000 - 11200     = 20800
-budget = { system:2000, state:500, recent:4000, memory:1500,
-           rag:1500, remote:1000, headroom:11200, window:32000 }
+// 2026-11-26 起：窗口 1M 只作上限，分区 = min(比例 × A, 硬顶)，见 src/context/budget.js
+window  = 1048576
+A       = (window - outputReserve 16384) * 0.90 = 928972
+budget  = { system:8192, state:2048, memory:4096, rag:4096,
+            recent:10240, remote:2048, headroom:8192 }   // interactive 档，装配量 30720
+// analysis 档装配量 94208；longdoc 档 200704
 ```
 
 分区软上限合计 `2000+500+4000+1500+1500+1000 = 10500`。与 `usableTokens` 之间还有 **10,300 token 未显式分配**。原因可以从代码意图推断：近程轨迹并不注入 `systemText`，而是由真实 `messages` 数组承载，历史随工具轮次增长；这段余量相当于给「历史膨胀 / 工具返回 / 生成」留的缓冲，但**代码没有实现动态抢占调度**，它只是静态余量。
@@ -114,7 +116,7 @@ budget = { system:2000, state:500, recent:4000, memory:1500,
 | recent | 4000 | 每条消息内容截 4,000 字符 + `tool_calls` JSON（`:53-59`） | **仅把报告数字压到 4000，真实 `recent` 数组未截断**（`:60-65`） |
 | memory | 1500 | 按 `similarity` 降序逐条累加 `estimateTokens(m.text)`（`:67-82`） | 超预算丢弃低相似度项，记录 `drop_low_similarity` |
 | rag | 1500 | 用证据自带的 `e.tokens ?? estimateTokens(e.content)`（`:88-101`） | 超预算丢弃证据，记录 `drop_evidence` |
-| remote | 1000 | `buildRemoteSummary` 先按 `CTX_REMOTE_TOKENS * 2 = 2000` 字符拼摘要（`:103-109`） | 估算超限时 `slice(0, B.remote * 2)`，即仍截 2,000 字符 |
+| remote | 1000 | `buildRemoteSummary` 先按 `config.budget.remote * 2 = 4096` 字符拼摘要（`:103-109`） | 估算超限时 `slice(0, B.remote * 2)`，即仍截 2,000 字符 |
 
 **溢出判定**（`:122-126`）：
 
@@ -183,13 +185,13 @@ overflow = total + headroom > window
    - `if (used + tokens > budgetTokens && evidence.length) break;`
    - ⚠️ `&& evidence.length` 意味着**第一块即使超预算也会被保留**，避免零证据。
    - 返回 `usedTokens`，并写入 trace 的 `evidence` 阶段。
-5. `nodes.js:106-108` 调用时显式传 `budgetTokens: config.CTX_RAG_TOKENS`（1500），与上下文分区 rag 预算同源。
+5. `nodes.js` 调用时显式传 `budgetTokens: 当前档位的 rag 预算`（interactive 4096 / analysis 12288），与上下文分区同源，避免检索侧和装配侧按两套数走。
 6. BGE 的 query+passage 有长度上限（服务实现常截到 512 token），而项目 chunk 本身是 512 token，所以送 API 前先按 `RERANK_MAX_CHARS=1600` 截短，并设 `max_chunks_per_doc=1` 禁止服务端再切块——切块会改变分数含义、增加用量。
 
 ### 3.4 记忆召回与远端摘要
 
 - `src/memory/recall.js:9-15`：每轮 `embedQuery(query)` 一次（外部计费），情景/语义各检索 top5。
-- `src/memory/recall.js:44-54`：`buildRemoteSummary` 把每条情景截到 80 字符，累计不超过 `CTX_REMOTE_TOKENS * 2 = 2000` 字符，附 traceId 索引。
+- `src/memory/recall.js:44-54`：`buildRemoteSummary` 把每条情景截到 80 字符，累计不超过 `config.budget.remote * 2 = 4096` 字符，附 traceId 索引。
 - `src/context/assemble.js:103-110` 再次按 1000 token 预算判断，但裁剪动作仍是截 2,000 字符，**不是严格 1000 token**。
 
 ### 3.5 主模型推理与工具循环

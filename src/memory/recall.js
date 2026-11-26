@@ -54,7 +54,7 @@ export async function recallMemories(embedder, { tenantId, userId, query, halfLi
 }
 
 /** 远端摘要：情景记忆的有损压缩带索引，支持回捞原始 trace（此处不做二次喂给事实层）。 */
-export function buildRemoteSummary(episodes, maxChars = config.CTX_REMOTE_TOKENS * 2) {
+export function buildRemoteSummary(episodes, maxChars = config.budget.remote * 2) {
   if (!episodes.length) return { text: "", traceIds: [] };
   const lines = episodes.map((e, i) => `${i + 1}. ${e.text.slice(0, 80)} (${e.id})`);
   let text = "";

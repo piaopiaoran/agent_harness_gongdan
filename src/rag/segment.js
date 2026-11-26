@@ -71,3 +71,14 @@ export function estimateTokens(text) {
   const rest = s.length - cjk;
   return Math.ceil(cjk + rest / 4);
 }
+
+/**
+ * 预算尺子：估算取 +10% 上界。
+ * 说明：标准里还有一条「中英混排用 chars/1.8 兜底」的口径，这里没有启用——
+ * 该口径对非中文文本会高估约 2 倍（英文 1 token ≈ 4 字符，chars/1.8 等于 1 token ≈ 1.8 字符），
+ * 直接启用会把纯英文轨迹砍掉一半。只有在实测发现 tokenizer 偏差超过 10% 时，
+ * 才应在 budget.js 里按语料类型单独标定，而不是全局兜底。
+ */
+export function estimateTokensUpper(text) {
+  return Math.ceil(estimateTokens(text) * 1.1);
+}

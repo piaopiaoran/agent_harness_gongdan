@@ -111,6 +111,19 @@ export function buildApp(runtime) {
       embeddingMode: config.embeddingMode,
       tracing: tracingStatus(),
       budgets: config.budget,
+      context: {
+        window: config.context.window,
+        safetyMargin: config.context.safetyMargin,
+        requestedProfile: config.context.requestedProfile,
+        defaultProfile: config.context.defaultProfile,
+        profiles: Object.fromEntries(Object.entries(config.context.profiles).map(([name, b]) => [name, {
+          assemblyCap: b.assemblyCap,
+          headroom: b.headroom,
+          outputReserve: b.outputReserve,
+          system: b.system, state: b.state, memory: b.memory,
+          rag: b.rag, recent: b.recent, remote: b.remote,
+        }])),
+      },
       pricing: {
         currency: config.pricing.currency,
         overrideModels: Object.keys(config.pricing.overrides),

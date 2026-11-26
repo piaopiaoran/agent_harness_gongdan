@@ -8,6 +8,7 @@ import { maskPII } from "../security/pii.js";
 import { recallMemories } from "../memory/recall.js";
 import { retrieveEvidence } from "../rag/retrieve.js";
 import { assembleContext } from "../context/assemble.js";
+import { selectContextProfile } from "../context/budget.js";
 import { recordTurn as recordWorkingTurn } from "../memory/working.js";
 import { llmCallConfig } from "../observability/tracing.js";
 
@@ -104,8 +105,11 @@ export function createNodes(deps) {
     // ---------------- RAG 双路召回 + RRF + 精排（证据不足 fail-close）----------------
     async retrieveRAG(state) {
       try {
+        // 档位在这里先定一次：RAG 的检索预算属于「记忆区」，必须与装配预算同档
+        const ctxProfile = selectContextProfile(state.input.text, config.context.requestedProfile);
+        const ctxBudget = config.context.profiles[ctxProfile];
         const r = await retrieveEvidence(embedder, state.input.text, {
-          tenantId: identity.tenantId, budgetTokens: config.CTX_RAG_TOKENS,
+          tenantId: identity.tenantId, budgetTokens: ctxBudget.rag,
         });
         await emit("retrieveRAG", r.refused ? "rag_refused" : "rag_retrieved",
           r.refused ? "deny" : "allow", r.trace.degradations.map((d) => `${d.stage}:${d.policy}`),
@@ -117,8 +121,9 @@ export function createNodes(deps) {
       }
     },
 
-    // ---------------- 上下文编排：共享窗口 + 软上限 + Headroom ----------------
+    // ---------------- 上下文编排：比例预算 + 分区硬顶 + 三档路由 ----------------
     async assembleContext(state) {
+      const profile = selectContextProfile(state.input.text, config.context.requestedProfile);
       const a = assembleContext({
         systemPrompt: SYSTEM_PROMPT,
         agentState: {
@@ -130,6 +135,7 @@ export function createNodes(deps) {
         ragEvidence: state.rag.evidence,
         remoteEpisodes: state.memories.episodes,
         question: state.input.text,
+        profile,
       });
       if (a.report.overflow) {
         await emit("assembleContext", "context_overflow", "degrade", ["context_overflow"], a.report);
