@@ -370,26 +370,53 @@ function renderContext(report) {
   const box = $("budget");
   box.replaceChildren();
   if (!report) { box.append(el("p", "empty", "尚未编排")); return; }
-  const rows = [
-    ["系统指令", report.regions.system, report.budget.system, ""],
-    ["Agent State", report.regions.state, report.budget.state, ""],
-    ["检索记忆", report.regions.memory, report.budget.memory, "memory"],
-    ["RAG 证据", report.regions.rag, report.budget.rag, "rag"],
-    ["远端摘要", report.regions.remote, report.budget.remote, ""],
-    ["近程轨迹", report.regions.recent, report.budget.recent, ""],
-    ["Headroom（预留）", report.headroom, report.headroom, "headroom"],
+
+  // 全局口径：A = floor((window − outputReserve) × (1 − safetyMargin))
+  const A = report.available;
+  box.append(el("div", "budget-global",
+    `档位 ${report.profile} · 装配上限 ${report.assemblyCap} tok · ` +
+    `A = floor((${report.window} − ${report.outputReserve}) × (1 − ${report.safetyMargin})) = ${A}`));
+
+  const layers = [
+    { key: "system", label: "系统指令", cls: "" },
+    { key: "state", label: "Agent State", cls: "" },
+    { key: "memory", label: "检索记忆", cls: "memory" },
+    { key: "rag", label: "RAG 证据", cls: "rag" },
+    { key: "remote", label: "远端摘要", cls: "" },
+    { key: "recent", label: "近程轨迹", cls: "" },
   ];
-  for (const [label, used, cap, cls] of rows) {
+  for (const l of layers) {
+    const used = report.regions[l.key];
+    const cap = report.budget[l.key];
+    const ratio = report.ratios?.[l.key];
+    const hardCap = report.caps?.[l.key];
     const row = el("div", "budget-row");
     const head = el("div", "bar-head");
-    head.append(el("span", "", label), el("span", "", `${used} / ${cap} tok`));
+    head.append(el("span", "", l.label), el("span", "", `${used} / ${cap} tok`));
     const track = el("div", "track");
-    const fill = el("div", `fill ${cls}`);
+    const fill = el("div", `fill ${l.cls}`);
     fill.style.width = `${Math.min(100, (used / Math.max(1, cap)) * 100)}%`;
     track.append(fill);
-    row.append(head, track);
+    const usedRule = report.usedRules?.[l.key] ?? "";
+    const ratioBound = ratio != null ? Math.floor(A * ratio) : "?";
+    const capRule = `配额 = min(A × ${ratio}, ${hardCap}) = min(${ratioBound}, ${hardCap}) = ${cap}`;
+    row.append(head, track, el("div", "budget-rule", `${usedRule} ｜ ${capRule}`));
     box.append(row);
   }
+
+  // Headroom：预留缓冲，不参与已用统计
+  const hr = report.headroom;
+  const hrRow = el("div", "budget-row");
+  const hrHead = el("div", "bar-head");
+  hrHead.append(el("span", "", "Headroom（预留）"), el("span", "", `${hr} / ${hr} tok`));
+  const hrTrack = el("div", "track");
+  const hrFill = el("div", "fill headroom");
+  hrFill.style.width = "100%";
+  hrTrack.append(hrFill);
+  hrRow.append(hrHead, hrTrack, el("div", "budget-rule",
+    "预留缓冲 = caps.headroom（不参与已用统计；A 已扣掉输出预留与安全余量，此处再留硬顶防工具返回膨胀）"));
+  box.append(hrRow);
+
   box.append(el("div", "hint-block", `窗口 ${report.window} tok · 已用 ${report.total} tok · 实际剩余 ${report.headroomActual} tok · 溢出 ${report.overflow ? "是" : "否"}`));
 
   const trim = $("trimming");
@@ -654,7 +681,6 @@ function renderLearn() {
     ["RAG 为什么双路召回 + 精排？", `<p>bge-m3 向量路擅长语义，jieba 风格关键词路擅长型号 / 订单号 / 专名。两路各取 30 条走 RRF(k=60)，前 20 进精排，阈值 0.30 后留 6 块证据。证据不足时拒答，不编造。</p>`],
     ["自动化评测为什么既用断言又用 judge？", `<p><code>npm run eval:smith</code> 会把评测集同步成 LangSmith dataset，跑 experiment：code 评测器判机制硬断言（引用 / 工具白名单 / PII / 审批），LLM judge 判语义软质量（忠实度 / 决策合理性，默认 <code>jev-latest</code>）。分数作为 feedback 写回平台，可按 key 筛选、跨版本对比。硬断言 fail-close，judge fail-open，避免把模型抖动当门禁。</p>`],
     ["为什么 fail-close / fail-open 要分开？", `<p>越权、PII、无证据作答一律 fail-close；精排、内容护栏、审计这类质量增强组件 fail-open 加告警。全 fail-close 会把可用性拖垮，全 fail-open 会把风险放出去。</p>`],
-    ["共享 PGlite 的坑", `<p>底层单实例，同一时刻只能处理一个 IO，连接池必须用 max=1；否则 checkpoint 写入与审计并发时会出现 “unnamed prepared statement does not exist”。真实 PostgreSQL 可调大连接池。</p>`],
   ];
   box.replaceChildren();
   for (const [title, html] of sections) {

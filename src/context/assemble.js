@@ -38,6 +38,17 @@ export function assembleContext({
     headroom: B.headroom,
     assemblyCap: B.assemblyCap,
     caps: B.caps,
+    // 前端「上下文」tab 展示每层配额公式用：配额 = min(A × ratio, hardCap)。
+    ratios: B.ratios,
+    // 每层「已用」token 的计算口径随计算代码一起维护，避免前后端 drift。
+    usedRules: {
+      system: "已用 = estimateTokensUpper(系统指令原文)，原文不压缩不裁剪",
+      state: "已用 = estimateTokensUpper(JSON(state) 截断到 配额×4 字符)",
+      memory: "已用 = 逐条 estimateTokensUpper 累加，超配额丢低相似度、保 top3",
+      rag: "已用 = Σ(e.tokens ? ⌈tokens×1.1⌉ : estimateTokensUpper(content))，超配额丢块",
+      remote: "已用 = estimateTokensUpper(压缩摘要)，超配额按 配额×2 字符有损截断",
+      recent: "已用 = estimateTokensUpper(轨迹渲染)，超配额先砍最旧(保首轮)、再按配额截断",
+    },
     budget: {
       system: B.system, state: B.state, memory: B.memory,
       rag: B.rag, recent: B.recent, remote: B.remote,

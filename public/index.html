@@ -80,7 +80,7 @@
         <button class="tab" data-tab="rag">RAG</button>
         <button class="tab" data-tab="memory">记忆</button>
         <button class="tab" data-tab="context">上下文</button>
-        <button class="tab" data-tab="usage">用量</button>
+        <button class="tab" data-tab="usage">token</button>
         <button class="tab" data-tab="security">安全</button>
         <button class="tab" data-tab="eval">评测</button>
         <button class="tab" data-tab="learn">讲解</button>
@@ -109,6 +109,12 @@
       </div>
 
       <div class="tab-panel" id="tab-memory" hidden>
+        <div class="primer">
+          <div class="primer-head">三层记忆 + 一层快照 <span class="hint">下面只展示在线召回的两路</span></div>
+          <div><b>三层记忆：</b>工作记忆（每轮流水，只做审计与蒸馏，不进 prompt）→ 情景记忆（异步蒸馏的摘要，带目标 / 结果 / 失败点 / 溯源 trace）→ 语义记忆（从原始消息抽取的稳定事实）。</div>
+          <div><b>一层快照：</b>Checkpoint 只存图执行快照，不算长期记忆。</div>
+          <div><b>为什么这里只看到两层：</b>工作记忆不进 prompt、Checkpoint 只是快照，在线召回的只有语义 + 情景两路。</div>
+        </div>
         <h3>语义记忆 · 稳定事实</h3>
         <div class="facts" id="facts"><p class="empty">加载中…</p></div>
         <h3>情景记忆 · 蒸馏摘要</h3>
@@ -121,7 +127,9 @@
         <div class="budget" id="budget"></div>
         <h3>裁剪记录</h3>
         <div class="trimming" id="trimming"></div>
-        <p class="hint-block">填充优先级：系统指令 → Agent State → 近程轨迹 → 检索记忆 → 远端摘要；Headroom 强制预留 35%。这里是<b>估算 token</b>（中文 1 字≈1 token），只用于分配预算，不等于计费 token；真实用量看「用量」标签。</p>
+        <p class="hint-block">每层「已用」= <code>estimateTokensUpper</code>（估算 ×1.1 上界），「配额」= <code>min(A × 分区比例, 硬顶)</code>，其中 <code>A = floor((窗口 − 输出预留) × (1 − 安全余量))</code>。这里是<b>估算 token</b>，只用于分配预算，不等于计费 token；真实用量看「token」标签。</p>
+        <h3>超出装配上限怎么办</h3>
+        <p class="hint-block">每区配额已硬卡，超限在<b>区内就地解决</b>，不会等装配完再兜底：先去重 → 丢低相似度记忆 / 多余证据 → 砍旧轨迹（保首轮）→ 有损压远端摘要；系统前缀与当前输入永不裁。每次裁剪都留痕（见上方裁剪记录 + 审计事件），可回查。<code>assemblyCap</code> 只是六区配额之和，不是装配后再检查的额外约束。</p>
       </div>
 
       <div class="tab-panel" id="tab-usage" hidden>
