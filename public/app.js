@@ -371,12 +371,12 @@ function renderContext(report) {
   box.replaceChildren();
   if (!report) { box.append(el("p", "empty", "尚未编排")); return; }
   const rows = [
-    ["系统指令", report.regions.system, report.softCaps.system, ""],
-    ["Agent State", report.regions.state, report.softCaps.state, ""],
-    ["检索记忆", report.regions.memory, report.softCaps.memory, "memory"],
-    ["RAG 证据", report.regions.rag, report.softCaps.rag, "rag"],
-    ["远端摘要", report.regions.remote, report.softCaps.remote, ""],
-    ["近程轨迹", report.regions.recent, report.softCaps.recent, ""],
+    ["系统指令", report.regions.system, report.budget.system, ""],
+    ["Agent State", report.regions.state, report.budget.state, ""],
+    ["检索记忆", report.regions.memory, report.budget.memory, "memory"],
+    ["RAG 证据", report.regions.rag, report.budget.rag, "rag"],
+    ["远端摘要", report.regions.remote, report.budget.remote, ""],
+    ["近程轨迹", report.regions.recent, report.budget.recent, ""],
     ["Headroom（预留）", report.headroom, report.headroom, "headroom"],
   ];
   for (const [label, used, cap, cls] of rows) {
